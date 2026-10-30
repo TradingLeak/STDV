@@ -1,0 +1,2305 @@
+// © Bandz-ICT
+// Bandz-authored STDV and CISD methodology, independently implemented in Pine Script.
+//
+// v2 — audit pass 1 (two changes only; detection logic untouched)
+//   1. Retired projections are never deleted. An invalidated (-1) or exhausted
+//      (-2 status) setup loses its live drawings but leaves a dotted "ghost"
+//      marker at the level where it died, so the chart can no longer filter
+//      itself down to surviving setups only.
+//   2. Realtime now matches reload. Anchor invalidation and -4 exhaustion are
+//      finalised only on closed candles. Historical bars and the live bar are
+//      both evaluated once per closed candle, so the tick sequence inside a
+//      forming bar can no longer change which projections survive.
+
+//@version=6
+indicator("Bandz STDV & CISD", shorttitle="Bandz STDV", overlay=true,
+     max_bars_back=256, max_lines_count=500, max_labels_count=500, max_boxes_count=500, dynamic_requests=true)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type Candidate
+    int direction
+    int referenceTime
+    float referencePrice
+    int firstSweepTime
+    int extremeTime
+    float extreme
+    int extremeBar
+    int startBar
+    int competitionStart
+    float cisd
+    int cisdOriginTime
+    int cisdConfirmTime
+    float cisdConfirmClose
+    int cisdConfirmBar
+    float swing
+    int swingTime
+    int stage                       // 0 = wait for CISD, 1 = wait for prior-swing breach
+    float liquidityImportance
+    float deliveryQuality
+
+type LayerSnapshot
+    int bullRevision
+    int bullWindow
+    int bullConfirmTime
+    int bullFirstSweepTime
+    int bullA0Time
+    float bullA0
+    int bullA1Time
+    float bullA1
+    int bullCisdOriginTime
+    int bullCisdConfirmTime
+    float bullCisd
+    int bullReferenceTime
+    float bullReferencePrice
+    float bullScore
+    int bearRevision
+    int bearWindow
+    int bearConfirmTime
+    int bearFirstSweepTime
+    int bearA0Time
+    float bearA0
+    int bearA1Time
+    float bearA1
+    int bearCisdOriginTime
+    int bearCisdConfirmTime
+    float bearCisd
+    int bearReferenceTime
+    float bearReferencePrice
+    float bearScore
+    int bullPendingId
+    float bullPendingCisd
+    int bearPendingId
+    float bearPendingCisd
+    int nativeTime
+    float nativeOpen
+    float nativeHigh
+    float nativeLow
+    float nativeClose
+    int bullCandidateCount
+    int bearCandidateCount
+    int debugReferenceHighTime
+    float debugReferenceHigh
+    int debugReferenceLowTime
+    float debugReferenceLow
+
+type Projection
+    int layer
+    int direction                  // 1 bullish, -1 bearish
+    string confirmationTf
+    string liquidityTf
+    string competitionTf
+    int competitionStart
+    int revision
+    int confirmationTime
+    int firstSweepTime
+    int anchor0Time
+    float anchor0
+    int anchor1Time
+    float anchor1
+    int cisdOriginTime
+    int cisdConfirmTime
+    float cisd
+    int referenceTime
+    float referencePrice
+    string eventId
+    float projectionRange
+    float selectionScore
+    int status                     // 0 active, 1 anchor invalidated, 2 -4 exhausted, 3 superseded
+    int endTime
+    int lastLifecycleTime
+    int firstObjectiveHitTime      // first touch of the -2 to -2.5 objective zone (triggered at -2)
+    int deepObjectiveHitTime       // first touch of -3.5; retained for lifecycle/debug context
+    array<float> ratios
+    array<line> ratioLines
+    array<label> ratioLabels
+    array<box> ratioBoxes
+    box liveMinusTwoBox
+    box liveMinusFourBox
+    line cisdLine
+    label cisdLabel
+    int deadTime                   // v2: when the setup was retired (-1 / -2 status). na while active.
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+string GROUP_DETECTION = "Core rule"
+string setupSensitivityInput = input.string("Balanced", "Setup sensitivity", options=["Loose", "Balanced", "Strict"],
+     tooltip="Loose allows more time for the same setup sequence. Strict requires faster CISD and swing confirmation.", group=GROUP_DETECTION)
+string htfViolationMode = input.string("Wick", "Liquidity sweep uses", options=["Wick", "Body close"], group=GROUP_DETECTION)
+string anchorInvalidationMode = input.string("Wick", "Anchor invalidation", options=["Wick", "Body close", "Disabled"],
+     tooltip="Deletes the entire CISD, anchor, and STDV set when the manipulation anchor is breached.", group=GROUP_DETECTION)
+string minusFourCompletionMode = input.string("Wick", "At -4 objective", options=["Wick", "Body close", "Keep visible"],
+     tooltip="Controls when a completed -4 projection is deleted.", group=GROUP_DETECTION)
+bool extendConfirmedCisd = input.bool(false, "Extend confirmed CISD",
+     tooltip="On extends the confirmed CISD until deletion. Off ends it at the CISD confirmation candle.", group=GROUP_DETECTION)
+bool protectCompetitionExtremes = input.bool(true, "Protect current-window extremes",
+     tooltip="Always displays the lowest bullish and highest bearish valid CISDs in the active competition window.", group=GROUP_DETECTION)
+int sweepToleranceTicks = setupSensitivityInput == "Loose" ? 0 : setupSensitivityInput == "Strict" ? 2 : 1
+bool includeDeliveryDoji = false
+bool includeDeliveryInside = true
+int deliverySearchGap = 1
+bool requireStructureClose = false
+bool requireRapidReclaim = true
+bool requireRapidSwingBreak = true
+int maxBarsCisdToSwing = 8
+int swingStrength = 2
+int swingSearchBars = 30
+bool useNearestSwingFallback = false
+string swingBreachMode = "Body close"
+// Delivery length is structural, not a tuning parameter. Scan until the
+// contiguous leg ends; this generous constant is only a loop safety bound.
+const int MIN_DELIVERY_CANDLES = 2
+const int DELIVERY_SCAN_LIMIT = 12
+
+// Fixed routing keeps timeframe changes simple and prevents invalid combinations.
+string group1StartTf = "1"
+string group1MaxTf = "5"
+string group3StartTf = "60"
+string group4StartTf = "240"
+string group5StartTf = "D"
+bool showDailyNativeInGroup5 = true
+bool alsoShowLegacyDailyInGroup5 = false
+
+string REF_NORMAL = "Normal completed highs/lows"
+string REF_SWING = "Confirmed swing highs/lows"
+string REF_EXTREME = "Lookback highest/lowest extreme"
+string SELECT_HYBRID = "Hybrid: 2 recent + 2 strongest"
+string SELECT_RECENT = "Most recent"
+string SELECT_RANGE = "Largest projection range"
+string SELECT_SCORE = "Strongest composite score"
+string SELECT_CLOSEST = "Closest unresolved objectives to current price"
+string MTF_HYBRID = "Hybrid: nearest + newest"
+string MTF_NEAREST = "Nearest groups"
+string MTF_RECENT = "Most recent"
+
+string GROUP_SIMPLE = "Simple display"
+int maxVisibleSets = input.int(4, "Maximum visible sets", minval=2, maxval=10, group=GROUP_SIMPLE)
+bool showMtfSets = input.bool(true, "Show higher-timeframe sets",
+     tooltip="Keeps the normal sets for the chart's primary group and adds a limited number of higher-timeframe groups.",
+     group=GROUP_SIMPLE)
+int maxMtfGroups = input.int(2, "Maximum MTF groups", minval=1, maxval=5,
+     tooltip="Limits higher-timeframe display to one active set from each selected group.", group=GROUP_SIMPLE)
+string mtfSelectionMode = input.string("Hybrid: nearest + newest", "MTF selection",
+     options=["Hybrid: nearest + newest", "Nearest groups", "Most recent"],
+     tooltip="Hybrid always keeps the nearest higher group, then fills remaining slots with the newest active groups.", group=GROUP_SIMPLE)
+
+// Each chart range now uses a fixed, tested preset. Only the useful on/off
+// switches remain in Settings; all of the noisy expert tuning stays internal.
+string GROUP_M1 = "1m preset — 15m liquidity | 1m CISD | 90m context"
+bool layer6Master = input.bool(true, "Enable", group=GROUP_M1)
+string layer6LiquidityTf = "15"
+string layer6ConfirmationTf = "1"
+string layer6ReferenceMode = REF_NORMAL
+int layer6NormalLookback = 12
+int layer6SwingStrength = 2
+int layer6ExtremeLength = 12
+int layer6CandidateLifetime = 24
+// The 1m delivery leg must contain at least MIN_DELIVERY_CANDLES (2)
+// genuine 1m candles, and the reclaim must occur within 8 one-minute bars.
+int layer6CisdLifetime = 8
+bool layer6CompetitionEnabled = true
+string layer6CompetitionTf = "90"
+int layer6ScanDepth = 1500
+int layer6Retention = 1500
+int layer6MaxStored = 20
+int layer6MaxTotal = maxVisibleSets
+int layer6MaxBull = 3
+int layer6MaxBear = 3
+string layer6SelectionMode = SELECT_HYBRID
+int layer6MarkerBars = 5
+int layer6HistoricalOpacity = 15
+
+string GROUP_A = "5m preset — 1H liquidity | 5m CISD | 4H context"
+bool layer0Master = input.bool(true, "Enable", group=GROUP_A)
+string layer0LiquidityTf = "60"
+string layer0ConfirmationTf = "5"
+string layer0ReferenceMode = REF_NORMAL
+int layer0NormalLookback = 12
+int layer0SwingStrength = 2
+int layer0ExtremeLength = 12
+int layer0CandidateLifetime = 24
+int layer0CisdLifetime = 8
+bool layer0CompetitionEnabled = true
+string layer0CompetitionTf = "240"
+int layer0ScanDepth = 1000
+int layer0Retention = 1000
+int layer0MaxStored = 20
+int layer0MaxTotal = maxVisibleSets
+int layer0MaxBull = 3
+int layer0MaxBear = 3
+string layer0SelectionMode = SELECT_HYBRID
+int layer0MarkerBars = 5
+int layer0HistoricalOpacity = 15
+
+string GROUP_B = "15m preset — 4H liquidity | 15m CISD | Daily context"
+bool layer1Master = input.bool(true, "Enable", group=GROUP_B)
+string layer1LiquidityTf = "240"
+string layer1ConfirmationTf = "15"
+string layer1ReferenceMode = REF_NORMAL
+int layer1NormalLookback = 12
+int layer1SwingStrength = 2
+int layer1ExtremeLength = 6
+int layer1CandidateLifetime = 24
+int layer1CisdLifetime = 8
+bool layer1CompetitionEnabled = true
+string layer1CompetitionTf = "D"
+int layer1ScanDepth = 1000
+int layer1Retention = 1000
+int layer1MaxStored = 20
+int layer1MaxTotal = maxVisibleSets
+int layer1MaxBull = 3
+int layer1MaxBear = 3
+string layer1SelectionMode = SELECT_HYBRID
+int layer1MarkerBars = 5
+int layer1HistoricalOpacity = 15
+
+string GROUP_C = "1H preset — 4H liquidity | 1H CISD | Daily context"
+bool layer2Master = input.bool(true, "Enable", group=GROUP_C)
+string layer2LiquidityTf = "240"
+string layer2ConfirmationTf = "60"
+string layer2ReferenceMode = REF_NORMAL
+int layer2NormalLookback = 12
+int layer2SwingStrength = 2
+int layer2ExtremeLength = 12
+int layer2CandidateLifetime = 24
+int layer2CisdLifetime = 5
+bool layer2CompetitionEnabled = true
+string layer2CompetitionTf = "D"
+int layer2ScanDepth = 750
+int layer2Retention = 750
+int layer2MaxStored = 20
+int layer2MaxTotal = maxVisibleSets
+int layer2MaxBull = 3
+int layer2MaxBear = 3
+string layer2SelectionMode = SELECT_HYBRID
+int layer2MarkerBars = 5
+int layer2HistoricalOpacity = 15
+
+string GROUP_D = "4H preset — Daily liquidity | 4H CISD | Weekly context"
+bool layer3Master = input.bool(true, "Enable", group=GROUP_D)
+string layer3LiquidityTf = "D"
+string layer3ConfirmationTf = "240"
+string layer3ReferenceMode = REF_NORMAL
+int layer3NormalLookback = 12
+int layer3SwingStrength = 2
+int layer3ExtremeLength = 12
+int layer3CandidateLifetime = 48
+int layer3CisdLifetime = 12
+bool layer3CompetitionEnabled = true
+string layer3CompetitionTf = "W"
+int layer3ScanDepth = 500
+int layer3Retention = 500
+int layer3MaxStored = 20
+int layer3MaxTotal = maxVisibleSets
+int layer3MaxBull = 3
+int layer3MaxBear = 3
+string layer3SelectionMode = SELECT_HYBRID
+int layer3MarkerBars = 6
+int layer3HistoricalOpacity = 15
+
+string GROUP_E = "Daily+ preset — Daily liquidity | Daily CISD | Monthly context"
+bool layer4Master = input.bool(true, "Enable", group=GROUP_E)
+string layer4LiquidityTf = "D"
+string layer4ConfirmationTf = "D"
+string layer4ReferenceMode = REF_NORMAL
+int layer4NormalLookback = 20
+int layer4SwingStrength = 2
+int layer4ExtremeLength = 20
+int layer4CandidateLifetime = 60
+int layer4CisdLifetime = 20
+bool layer4CompetitionEnabled = true
+string layer4CompetitionTf = "M"
+int layer4ScanDepth = 500
+int layer4Retention = 500
+int layer4MaxStored = 20
+int layer4MaxTotal = maxVisibleSets
+int layer4MaxBull = 3
+int layer4MaxBear = 3
+string layer4SelectionMode = SELECT_HYBRID
+int layer4MarkerBars = 6
+int layer4HistoricalOpacity = 15
+
+// Disabled compatibility slot for older saved instances.
+bool layer5Master = false
+string layer5LiquidityTf = "D"
+string layer5ConfirmationTf = "D"
+string layer5ReferenceMode = REF_NORMAL
+int layer5NormalLookback = 20
+int layer5SwingStrength = 2
+int layer5ExtremeLength = 20
+int layer5CandidateLifetime = 60
+int layer5CisdLifetime = 20
+bool layer5CompetitionEnabled = true
+string layer5CompetitionTf = "M"
+int layer5ScanDepth = 500
+int layer5Retention = 500
+int layer5MaxStored = 20
+int layer5MaxTotal = maxVisibleSets
+int layer5MaxBull = 3
+int layer5MaxBear = 3
+string layer5SelectionMode = SELECT_HYBRID
+int layer5MarkerBars = 6
+int layer5HistoricalOpacity = 15
+
+float relevanceDistanceRanges = 1.0
+int duplicateToleranceTicks = 2
+
+string GROUP_LEVELS = "STDV levels"
+bool showZero = input.bool(true, "0", inline="lv0", group=GROUP_LEVELS)
+bool showOne = input.bool(true, "1", inline="lv0", group=GROUP_LEVELS)
+bool showMinusOne = input.bool(true, "-1", inline="lv1", group=GROUP_LEVELS)
+bool showMinusOnePointFive = input.bool(false, "-1.5", inline="lv1", group=GROUP_LEVELS)
+bool showMinusTwo = input.bool(true, "-2", inline="lv2", group=GROUP_LEVELS)
+bool showMinusTwoPointFive = input.bool(true, "-2.5", inline="lv2", group=GROUP_LEVELS)
+bool showMinusThreePointFive = input.bool(true, "-3.5", inline="lv3", group=GROUP_LEVELS)
+bool showMinusFour = input.bool(true, "-4", inline="lv3", group=GROUP_LEVELS)
+bool fillMinusOneZone = input.bool(true, "Fill -1 to -1.5", group=GROUP_LEVELS)
+bool fillMinusTwoZone = input.bool(true, "Fill -2 to -2.5", group=GROUP_LEVELS)
+bool fillMinusThreePointFiveZone = input.bool(true, "Fill -3.5 to -4", group=GROUP_LEVELS)
+color stdvZoneColor = input.color(color.rgb(156, 156, 156), "Zone color", inline="zone", group=GROUP_LEVELS)
+int stdvZoneTransparency = input.int(83, "Transparency", minval=0, maxval=100, inline="zone", group=GROUP_LEVELS)
+
+string GROUP_VISUAL = "Colors & lines"
+string labelSizeInput = input.string("Tiny", "Number size", options=["Tiny", "Small", "Normal"], group=GROUP_VISUAL)
+color stdvColor = input.color(color.rgb(35, 35, 35), "STDV lines & numbers", group=GROUP_VISUAL)
+string stdvLineStyleInput = input.string("Dotted", "STDV line style", options=["Solid", "Dotted", "Dashed"], inline="stdv", group=GROUP_VISUAL)
+int stdvLineWidth = input.int(1, "Thickness", minval=1, maxval=4, inline="stdv", group=GROUP_VISUAL)
+color anchorLineColor = input.color(color.rgb(35, 35, 35), "Anchor lines", group=GROUP_VISUAL)
+string anchorLineStyleInput = input.string("Dotted", "Anchor line style", options=["Solid", "Dotted", "Dashed"], inline="anchor", group=GROUP_VISUAL)
+int anchorLineWidth = input.int(1, "Thickness", minval=1, maxval=4, inline="anchor", group=GROUP_VISUAL)
+color bullishCisdColor = input.color(color.rgb(245, 127, 23), "Bullish CISD", inline="cisd", group=GROUP_VISUAL)
+color bearishCisdColor = input.color(color.rgb(245, 127, 23), "Bearish CISD", inline="cisd", group=GROUP_VISUAL)
+string cisdLineStyleInput = input.string("Solid", "CISD line style", options=["Solid", "Dotted", "Dashed"], inline="cisd_line", group=GROUP_VISUAL)
+int cisdLineWidth = input.int(2, "Thickness", minval=1, maxval=4, inline="cisd_line", group=GROUP_VISUAL)
+bool showCisdText = input.bool(false, "Show CISD text", group=GROUP_VISUAL)
+bool showPendingCisd = input.bool(false, "Show forming CISD", group=GROUP_VISUAL)
+// v2: retired setups stay on the chart instead of silently disappearing.
+bool showInvalidatedSetups = input.bool(true, "Show invalidated / completed sets", group=GROUP_VISUAL,
+     tooltip="A setup that is invalidated or runs to -4 keeps a dotted marker at the level where it died. Turn this off to hide the failures, but the statistics are still recorded.")
+bool useChartForeground = false
+bool showStatusTable = false
+
+// =============================================================================
+// GENERIC HELPERS
+// =============================================================================
+
+safeTfSeconds(string tf) =>
+    float seconds = timeframe.in_seconds(tf)
+    na(seconds) ? 1 : int(math.max(1.0, seconds))
+
+timeframeText(string tf) =>
+    switch tf
+        "1" => "1m"
+        "2" => "2m"
+        "3" => "3m"
+        "5" => "5m"
+        "10" => "10m"
+        "15" => "15m"
+        "20" => "20m"
+        "30" => "30m"
+        "45" => "45m"
+        "60" => "1H"
+        "120" => "2H"
+        "180" => "3H"
+        "240" => "4H"
+        "360" => "6H"
+        "480" => "8H"
+        "720" => "12H"
+        "D" => "1D"
+        "1D" => "1D"
+        "2D" => "2D"
+        "W" => "W"
+        "1W" => "W"
+        "M" => "M"
+        "1M" => "M"
+        => tf
+
+ratioText(float ratio) =>
+    ratio == 0.0 ? "0" :
+     ratio == 1.0 ? "1" :
+     ratio == -1.0 ? "-1" :
+     ratio == -1.5 ? "-1.5" :
+     ratio == -2.0 ? "-2" :
+     ratio == -2.5 ? "-2.5" :
+     ratio == -3.5 ? "-3.5" : "-4"
+
+projectionPrice(float anchor0, float anchor1, float ratio) =>
+    anchor0 + ratio * (anchor1 - anchor0)
+
+labelSizeFromString(string value) =>
+    value == "Small" ? size.small : value == "Normal" ? size.normal : size.tiny
+
+lineStyleFromString(string value) =>
+    value == "Dotted" ? line.style_dotted : value == "Dashed" ? line.style_dashed : line.style_solid
+
+ratioEnabled(float ratio) =>
+    ratio == 0.0 ? showZero :
+     ratio == 1.0 ? showOne :
+     ratio == -1.0 ? showMinusOne :
+     ratio == -1.5 ? showMinusOnePointFive :
+     ratio == -2.0 ? showMinusTwo :
+     ratio == -2.5 ? showMinusTwoPointFive :
+     ratio == -3.5 ? showMinusThreePointFive : showMinusFour
+
+arrayHasInt(array<int> values, int target) =>
+    bool found = false
+    if values.size() > 0
+        for i = 0 to values.size() - 1
+            if values.get(i) == target
+                found := true
+                break
+    found
+
+candidateIndexByReference(array<Candidate> values, int referenceTime) =>
+    int found = na
+    if values.size() > 0
+        for i = 0 to values.size() - 1
+            Candidate candidate = values.get(i)
+            if candidate.referenceTime == referenceTime
+                found := i
+                break
+    found
+
+rememberConsumedReference(array<int> values, int referenceTime) =>
+    if not arrayHasInt(values, referenceTime)
+        values.push(referenceTime)
+        if values.size() > 200
+            values.shift()
+    0
+
+// =============================================================================
+// NATIVE-TIMEFRAME DETECTION HELPERS
+// =============================================================================
+
+isBearDeliveryAt(int offset) =>
+    close[offset] < open[offset] or (includeDeliveryDoji and close[offset] == open[offset])
+
+isBullDeliveryAt(int offset) =>
+    close[offset] > open[offset] or (includeDeliveryDoji and close[offset] == open[offset])
+
+isInsideCandleAt(int offset) =>
+    not na(high[offset + 1]) and high[offset] <= high[offset + 1] and low[offset] >= low[offset + 1]
+
+isBearDeliveryMemberAt(int offset) =>
+    isBearDeliveryAt(offset) or
+     (includeDeliveryInside and isInsideCandleAt(offset) and
+      (isBearDeliveryAt(offset + 1) or (offset > 0 and isBearDeliveryAt(offset - 1))))
+
+isBullDeliveryMemberAt(int offset) =>
+    isBullDeliveryAt(offset) or
+     (includeDeliveryInside and isInsideCandleAt(offset) and
+      (isBullDeliveryAt(offset + 1) or (offset > 0 and isBullDeliveryAt(offset - 1))))
+
+isPivotHighAt(int offset, int strength) =>
+    bool valid = offset >= strength and not na(high[offset + strength]) and not na(high[offset - strength])
+    if valid
+        for n = 1 to strength
+            valid := valid and high[offset] > high[offset - n] and high[offset] >= high[offset + n]
+    valid
+
+isPivotLowAt(int offset, int strength) =>
+    bool valid = offset >= strength and not na(low[offset + strength]) and not na(low[offset - strength])
+    if valid
+        for n = 1 to strength
+            valid := valid and low[offset] < low[offset - n] and low[offset] <= low[offset + n]
+    valid
+
+bearishDeliveryRun(int baseOffset, int gapLimit) =>
+    int firstDelivery = na
+    for gap = 0 to gapLimit
+        int offset = baseOffset + gap
+        if not na(close[offset]) and isBearDeliveryMemberAt(offset)
+            firstDelivery := offset
+            break
+
+    float cisd = na
+    int cisdDefiningOffset = na
+    int oldestOffset = na
+    int memberCount = 0
+    int genuineCount = 0
+    bool hasStructureClose = false
+    if not na(firstDelivery)
+        for n = 0 to DELIVERY_SCAN_LIMIT - 1
+            int offset = firstDelivery + n
+            if not na(close[offset]) and isBearDeliveryMemberAt(offset)
+                // Neutral inside/doji candles may preserve continuity, but do
+                // not count as genuine delivery or define the CISD threshold.
+                if close[offset] < open[offset]
+                    genuineCount += 1
+                    float bodyTop = open[offset]
+                    if na(cisd) or bodyTop > cisd
+                        cisd := bodyTop
+                        cisdDefiningOffset := offset
+                    hasStructureClose := hasStructureClose or
+                         (not na(low[offset + 1]) and close[offset] < low[offset + 1])
+                oldestOffset := offset
+                memberCount += 1
+            else
+                break
+    [cisd, oldestOffset, memberCount, genuineCount, firstDelivery, cisdDefiningOffset, hasStructureClose]
+
+bullishDeliveryRun(int baseOffset, int gapLimit) =>
+    int firstDelivery = na
+    for gap = 0 to gapLimit
+        int offset = baseOffset + gap
+        if not na(close[offset]) and isBullDeliveryMemberAt(offset)
+            firstDelivery := offset
+            break
+
+    float cisd = na
+    int cisdDefiningOffset = na
+    int oldestOffset = na
+    int memberCount = 0
+    int genuineCount = 0
+    bool hasStructureClose = false
+    if not na(firstDelivery)
+        for n = 0 to DELIVERY_SCAN_LIMIT - 1
+            int offset = firstDelivery + n
+            if not na(close[offset]) and isBullDeliveryMemberAt(offset)
+                // Bearish inverse: neutral inside/doji members preserve only
+                // continuity; genuine bullish bodies define structure/CISD.
+                if close[offset] > open[offset]
+                    genuineCount += 1
+                    float bodyBottom = open[offset]
+                    if na(cisd) or bodyBottom < cisd
+                        cisd := bodyBottom
+                        cisdDefiningOffset := offset
+                    hasStructureClose := hasStructureClose or
+                         (not na(high[offset + 1]) and close[offset] > high[offset + 1])
+                oldestOffset := offset
+                memberCount += 1
+            else
+                break
+    [cisd, oldestOffset, memberCount, genuineCount, firstDelivery, cisdDefiningOffset, hasStructureClose]
+
+closestPriorSwingHigh(int finalDeliveryOffset, int searchWindow) =>
+    float swing = na
+    int swingTime = na
+    if not na(finalDeliveryOffset)
+        // Start immediately behind the final delivery candle nearest the
+        // manipulation. Starting before the entire delivery run can skip the
+        // first meaningful swing that price should take after CISD.
+        int firstOffset = math.max(finalDeliveryOffset + 1, swingStrength)
+        int lastOffset = firstOffset + searchWindow - 1
+        for offset = firstOffset to lastOffset
+            if isPivotHighAt(offset, swingStrength)
+                swing := high[offset]
+                swingTime := time[offset]
+                break
+        if na(swing) and useNearestSwingFallback and not na(high[firstOffset])
+            swing := high[firstOffset]
+            swingTime := time[firstOffset]
+    [swing, swingTime]
+
+closestPriorSwingLow(int finalDeliveryOffset, int searchWindow) =>
+    float swing = na
+    int swingTime = na
+    if not na(finalDeliveryOffset)
+        int firstOffset = math.max(finalDeliveryOffset + 1, swingStrength)
+        int lastOffset = firstOffset + searchWindow - 1
+        for offset = firstOffset to lastOffset
+            if isPivotLowAt(offset, swingStrength)
+                swing := low[offset]
+                swingTime := time[offset]
+                break
+        if na(swing) and useNearestSwingFallback and not na(low[firstOffset])
+            swing := low[firstOffset]
+            swingTime := time[firstOffset]
+    [swing, swingTime]
+
+// =============================================================================
+// NATIVE LAYER ENGINE
+// =============================================================================
+
+detectLayer(string liquidityTf, string referenceMode, int normalLookback, int liquiditySwingStrength,
+            int extremeLength, int candidateLifetime, int cisdLifetime,
+            bool competitionFilterEnabled, string competitionTf) =>
+    float nativeSecondsRaw = timeframe.in_seconds(timeframe.period)
+    bool higherTimeframeNative = not na(nativeSecondsRaw) and nativeSecondsRaw >= 14400.0
+    // Sensitivity changes timing tolerance without changing the underlying
+    // sweep -> CISD -> opposing-swing sequence. Loose finds more valid setups;
+    // Strict requires that same sequence to complete faster.
+    float sensitivityMultiplier = setupSensitivityInput == "Loose" ? 1.5 : setupSensitivityInput == "Strict" ? 0.65 : 1.0
+    int baseDeliveryGap = higherTimeframeNative ? math.max(deliverySearchGap, 2) : deliverySearchGap
+    int baseSwingSearchBars = higherTimeframeNative ? math.max(swingSearchBars, 30) : swingSearchBars
+    int baseCandidateLifetime = higherTimeframeNative ? math.max(candidateLifetime, 48) : candidateLifetime
+    int baseCisdLifetime = higherTimeframeNative ? math.max(cisdLifetime, 12) : cisdLifetime
+    int baseSwingBreakBars = higherTimeframeNative ? math.max(maxBarsCisdToSwing, 10) : maxBarsCisdToSwing
+    int effectiveDeliveryGap = setupSensitivityInput == "Loose" ? baseDeliveryGap + 1 : setupSensitivityInput == "Strict" ? math.max(0, baseDeliveryGap - 1) : baseDeliveryGap
+    int effectiveSwingSearchBars = math.max(10, int(math.round(baseSwingSearchBars * sensitivityMultiplier)))
+    int effectiveCandidateLifetime = math.max(4, int(math.round(baseCandidateLifetime * sensitivityMultiplier)))
+    int effectiveCisdLifetime = math.max(2, int(math.round(baseCisdLifetime * sensitivityMultiplier)))
+    int effectiveSwingBreakBars = math.max(2, int(math.round(baseSwingBreakBars * sensitivityMultiplier)))
+    bool effectiveRequireStructureClose = requireStructureClose and not higherTimeframeNative
+    // 15m and 1H CISDs may legitimately break an opposing swing that formed
+    // before the current Daily window. Daily still groups/competes confirmed
+    // projections; it no longer invalidates the structural swing itself.
+    bool relaxCompetitionSwingWindow = not na(nativeSecondsRaw) and
+         (nativeSecondsRaw == 15.0 * 60.0 or nativeSecondsRaw == 60.0 * 60.0)
+
+    var array<Candidate> bullCandidates = array.new<Candidate>()
+    var array<Candidate> bearCandidates = array.new<Candidate>()
+    var array<int> consumedBullReferences = array.new_int()
+    var array<int> consumedBearReferences = array.new_int()
+
+    // Build completed liquidity-timeframe candles from native confirmation
+    // bars. This avoids nested-request alignment and memory complexity while
+    // deriving every reference exclusively from closed native/HTF candles.
+    var int buildingLiquidityTime = na
+    var float buildingLiquidityHigh = na
+    var float buildingLiquidityLow = na
+    var array<int> completedLiquidityTimes = array.new_int()
+    var array<float> completedLiquidityHighs = array.new_float()
+    var array<float> completedLiquidityLows = array.new_float()
+    var array<int> bullWinnerWindows = array.new_int()
+    var array<float> bullWinnerScores = array.new_float()
+    var array<float> bullWinnerCisds = array.new_float()
+    var array<int> bearWinnerWindows = array.new_int()
+    var array<float> bearWinnerScores = array.new_float()
+    var array<float> bearWinnerCisds = array.new_float()
+
+    var int bullRevision = 0
+    var int bullWindow = na
+    var int bullConfirmTime = na
+    var int bullFirstSweepTime = na
+    var int bullA0Time = na
+    var float bullA0 = na
+    var int bullA1Time = na
+    var float bullA1 = na
+    var int bullCisdOriginTime = na
+    var int bullCisdConfirmTime = na
+    var float bullEventCisd = na
+    var int bullReferenceTime = na
+    var float bullReferencePrice = na
+    var float bullEventScore = na
+
+    var int bearRevision = 0
+    var int bearWindow = na
+    var int bearConfirmTime = na
+    var int bearFirstSweepTime = na
+    var int bearA0Time = na
+    var float bearA0 = na
+    var int bearA1Time = na
+    var float bearA1 = na
+    var int bearCisdOriginTime = na
+    var int bearCisdConfirmTime = na
+    var float bearEventCisd = na
+    var int bearReferenceTime = na
+    var float bearReferencePrice = na
+    var float bearEventScore = na
+
+    var int lastProcessedTime = na
+    var int lastReferenceHighTime = na
+    var float lastReferenceHigh = na
+    var int lastReferenceLowTime = na
+    var float lastReferenceLow = na
+    int processedTime = time[1]
+    float processedOpen = open[1]
+    float processedHigh = high[1]
+    float processedLow = low[1]
+    float processedClose = close[1]
+    float nativeAtrSeries = ta.atr(14)
+    int processedBarIndex = bar_index[1]
+    bool processBar = not na(processedTime) and (na(lastProcessedTime) or processedTime != lastProcessedTime)
+
+    if processBar
+        lastProcessedTime := processedTime
+        int processedLiquidityTime = time(liquidityTf)[1]
+        bool completedLiquidityBar = false
+
+        if not na(processedLiquidityTime)
+            if na(buildingLiquidityTime)
+                buildingLiquidityTime := processedLiquidityTime
+                buildingLiquidityHigh := processedHigh
+                buildingLiquidityLow := processedLow
+            else if processedLiquidityTime != buildingLiquidityTime
+                completedLiquidityTimes.push(buildingLiquidityTime)
+                completedLiquidityHighs.push(buildingLiquidityHigh)
+                completedLiquidityLows.push(buildingLiquidityLow)
+                if completedLiquidityTimes.size() > 128
+                    completedLiquidityTimes.shift()
+                    completedLiquidityHighs.shift()
+                    completedLiquidityLows.shift()
+                completedLiquidityBar := true
+                buildingLiquidityTime := processedLiquidityTime
+                buildingLiquidityHigh := processedHigh
+                buildingLiquidityLow := processedLow
+            else
+                buildingLiquidityHigh := na(buildingLiquidityHigh) ? processedHigh : math.max(buildingLiquidityHigh, processedHigh)
+                buildingLiquidityLow := na(buildingLiquidityLow) ? processedLow : math.min(buildingLiquidityLow, processedLow)
+
+        int liquidityCount = completedLiquidityTimes.size()
+        array<int> referenceHighTimes = array.new_int()
+        array<float> referenceHighPrices = array.new_float()
+        array<int> referenceLowTimes = array.new_int()
+        array<float> referenceLowPrices = array.new_float()
+
+        // Liquidity references are the only configurable part of activation.
+        // Every candidate still has to pass the frozen native CISD and opposing-
+        // swing sequence below.
+        if referenceMode == REF_NORMAL and liquidityCount > 0
+            int firstNormalIndex = math.max(0, liquidityCount - normalLookback)
+            for referenceIndex = firstNormalIndex to liquidityCount - 1
+                float candidateHigh = completedLiquidityHighs.get(referenceIndex)
+                float candidateLow = completedLiquidityLows.get(referenceIndex)
+                bool highUnresolved = true
+                bool lowUnresolved = true
+                if referenceIndex < liquidityCount - 1
+                    for newerIndex = referenceIndex + 1 to liquidityCount - 1
+                        highUnresolved := highUnresolved and completedLiquidityHighs.get(newerIndex) < candidateHigh
+                        lowUnresolved := lowUnresolved and completedLiquidityLows.get(newerIndex) > candidateLow
+                if highUnresolved
+                    referenceHighTimes.push(completedLiquidityTimes.get(referenceIndex))
+                    referenceHighPrices.push(candidateHigh)
+                if lowUnresolved
+                    referenceLowTimes.push(completedLiquidityTimes.get(referenceIndex))
+                    referenceLowPrices.push(candidateLow)
+        else if referenceMode == REF_SWING and liquidityCount >= liquiditySwingStrength * 2 + 1
+            int firstSwingIndex = math.max(liquiditySwingStrength, liquidityCount - normalLookback)
+            int lastSwingIndex = liquidityCount - 1 - liquiditySwingStrength
+            if firstSwingIndex <= lastSwingIndex
+                for referenceIndex = firstSwingIndex to lastSwingIndex
+                    float pivotHigh = completedLiquidityHighs.get(referenceIndex)
+                    float pivotLow = completedLiquidityLows.get(referenceIndex)
+                    bool confirmedHigh = true
+                    bool confirmedLow = true
+                    for step = 1 to liquiditySwingStrength
+                        confirmedHigh := confirmedHigh and pivotHigh >= completedLiquidityHighs.get(referenceIndex - step) and
+                             pivotHigh > completedLiquidityHighs.get(referenceIndex + step)
+                        confirmedLow := confirmedLow and pivotLow <= completedLiquidityLows.get(referenceIndex - step) and
+                             pivotLow < completedLiquidityLows.get(referenceIndex + step)
+                    bool highUnresolved = confirmedHigh
+                    bool lowUnresolved = confirmedLow
+                    if referenceIndex < liquidityCount - 1
+                        for newerIndex = referenceIndex + 1 to liquidityCount - 1
+                            highUnresolved := highUnresolved and completedLiquidityHighs.get(newerIndex) < pivotHigh
+                            lowUnresolved := lowUnresolved and completedLiquidityLows.get(newerIndex) > pivotLow
+                    if highUnresolved
+                        referenceHighTimes.push(completedLiquidityTimes.get(referenceIndex))
+                        referenceHighPrices.push(pivotHigh)
+                    if lowUnresolved
+                        referenceLowTimes.push(completedLiquidityTimes.get(referenceIndex))
+                        referenceLowPrices.push(pivotLow)
+        else if referenceMode == REF_EXTREME and liquidityCount > 0
+            int firstExtremeIndex = math.max(0, liquidityCount - extremeLength)
+            int extremeHighTime = na
+            float extremeHighPrice = na
+            int extremeLowTime = na
+            float extremeLowPrice = na
+            for referenceIndex = firstExtremeIndex to liquidityCount - 1
+                float candidateHigh = completedLiquidityHighs.get(referenceIndex)
+                float candidateLow = completedLiquidityLows.get(referenceIndex)
+                if na(extremeHighPrice) or candidateHigh > extremeHighPrice
+                    extremeHighTime := completedLiquidityTimes.get(referenceIndex)
+                    extremeHighPrice := candidateHigh
+                if na(extremeLowPrice) or candidateLow < extremeLowPrice
+                    extremeLowTime := completedLiquidityTimes.get(referenceIndex)
+                    extremeLowPrice := candidateLow
+            if not na(extremeHighTime)
+                referenceHighTimes.push(extremeHighTime)
+                referenceHighPrices.push(extremeHighPrice)
+            if not na(extremeLowTime)
+                referenceLowTimes.push(extremeLowTime)
+                referenceLowPrices.push(extremeLowPrice)
+
+        // Once activated, a candidate keeps its original reference until it
+        // confirms or expires. This lets its manipulation extreme continue to
+        // deepen even if the reference later rolls outside the liquidity
+        // lookback; it does not create a new candidate or a new reference.
+        if bullCandidates.size() > 0
+            for candidateIndex = 0 to bullCandidates.size() - 1
+                Candidate activeCandidate = bullCandidates.get(candidateIndex)
+                if not arrayHasInt(referenceLowTimes, activeCandidate.referenceTime)
+                    referenceLowTimes.push(activeCandidate.referenceTime)
+                    referenceLowPrices.push(activeCandidate.referencePrice)
+        if bearCandidates.size() > 0
+            for candidateIndex = 0 to bearCandidates.size() - 1
+                Candidate activeCandidate = bearCandidates.get(candidateIndex)
+                if not arrayHasInt(referenceHighTimes, activeCandidate.referenceTime)
+                    referenceHighTimes.push(activeCandidate.referenceTime)
+                    referenceHighPrices.push(activeCandidate.referencePrice)
+
+        lastReferenceHighTime := referenceHighTimes.size() > 0 ? referenceHighTimes.last() : na
+        lastReferenceHigh := referenceHighPrices.size() > 0 ? referenceHighPrices.last() : na
+        lastReferenceLowTime := referenceLowTimes.size() > 0 ? referenceLowTimes.last() : na
+        lastReferenceLow := referenceLowPrices.size() > 0 ? referenceLowPrices.last() : na
+
+        float sweepTolerance = sweepToleranceTicks * syminfo.mintick
+        float nativeAtr = nativeAtrSeries[1]
+        float importance = referenceMode == REF_SWING ? 4.0 : referenceMode == REF_EXTREME ? 3.0 : 2.0
+        float bullMeasure = htfViolationMode == "Body close" ? processedClose : processedLow
+        float bearMeasure = htfViolationMode == "Body close" ? processedClose : processedHigh
+        float priorBullMeasure = htfViolationMode == "Body close" ? close[2] : low[2]
+        float priorBearMeasure = htfViolationMode == "Body close" ? close[2] : high[2]
+
+        // Evaluate the working delivery/CISD/opposing-swing helpers once per
+        // native bar, then reuse their unchanged result for any swept reference.
+        [bullRunCisd, bullDeliveryOldestOffset, bullDeliveryMemberCount, bullGenuineDeliveryCount,
+             bullFirstDeliveryOffset, bullCisdDefiningOffset, bullHasStructureClose] = bearishDeliveryRun(1, effectiveDeliveryGap)
+        [bullSwingHigh, bullSwingHighTime] = closestPriorSwingHigh(bullFirstDeliveryOffset, effectiveSwingSearchBars)
+        int bullCisdOrigin = not na(bullCisdDefiningOffset) ? time[bullCisdDefiningOffset] : na
+        // Structure-producing delivery is separate from the wick/body event
+        // that swept the external liquidity reference.
+        bool bullSetupBaseValid = bullGenuineDeliveryCount >= MIN_DELIVERY_CANDLES and
+             (not effectiveRequireStructureClose or bullHasStructureClose) and not na(bullRunCisd) and not na(bullCisdOrigin) and
+             not na(bullSwingHigh) and not na(bullSwingHighTime) and bullSwingHigh > processedLow
+        float bullDeliveryQuality = bullSetupBaseValid ?
+             math.max(0.0, 1.0 - (bullFirstDeliveryOffset - 1) * 0.20) + math.max(0.0, 1.0 - math.abs(bullGenuineDeliveryCount - 2) * 0.20) : 0.0
+
+        [bearRunCisd, bearDeliveryOldestOffset, bearDeliveryMemberCount, bearGenuineDeliveryCount,
+             bearFirstDeliveryOffset, bearCisdDefiningOffset, bearHasStructureClose] = bullishDeliveryRun(1, effectiveDeliveryGap)
+        [bearSwingLow, bearSwingLowTime] = closestPriorSwingLow(bearFirstDeliveryOffset, effectiveSwingSearchBars)
+        int bearCisdOrigin = not na(bearCisdDefiningOffset) ? time[bearCisdDefiningOffset] : na
+        bool bearSetupBaseValid = bearGenuineDeliveryCount >= MIN_DELIVERY_CANDLES and
+             (not effectiveRequireStructureClose or bearHasStructureClose) and not na(bearRunCisd) and not na(bearCisdOrigin) and
+             not na(bearSwingLow) and not na(bearSwingLowTime) and bearSwingLow < processedHigh
+        float bearDeliveryQuality = bearSetupBaseValid ?
+             math.max(0.0, 1.0 - (bearFirstDeliveryOffset - 1) * 0.20) + math.max(0.0, 1.0 - math.abs(bearGenuineDeliveryCount - 2) * 0.20) : 0.0
+
+        if referenceLowTimes.size() > 0
+            for referenceIndex = 0 to referenceLowTimes.size() - 1
+                int referenceLowTime = referenceLowTimes.get(referenceIndex)
+                float referenceLow = referenceLowPrices.get(referenceIndex)
+                float bullThreshold = referenceLow - sweepTolerance
+                bool bullViolated = bullMeasure < bullThreshold
+                bool freshBullSweep = referenceLowTime < processedTime and bullViolated and
+                     not na(priorBullMeasure) and priorBullMeasure >= bullThreshold
+                if not arrayHasInt(consumedBullReferences, referenceLowTime)
+                    int candidateIndex = candidateIndexByReference(bullCandidates, referenceLowTime)
+                    bool createCandidate = na(candidateIndex) and freshBullSweep
+                    bool deepenCandidate = false
+                    if not na(candidateIndex)
+                        Candidate existing = bullCandidates.get(candidateIndex)
+                        deepenCandidate := bullViolated and processedLow < existing.extreme
+                    if createCandidate or deepenCandidate
+                        int competitionStart = competitionFilterEnabled ? time(competitionTf)[1] : referenceLowTime
+                        int candidateCompetitionStart = createCandidate ? competitionStart : bullCandidates.get(candidateIndex).competitionStart
+                        bool swingInCompetition = not competitionFilterEnabled or higherTimeframeNative or relaxCompetitionSwingWindow or
+                             (not na(candidateCompetitionStart) and bullSwingHighTime >= candidateCompetitionStart)
+                        bool bullSetupValid = bullSetupBaseValid and swingInCompetition
+                        if createCandidate
+                            Candidate fresh = Candidate.new(1, referenceLowTime, referenceLow, processedTime, processedTime,
+                                 processedLow, processedBarIndex, processedBarIndex, competitionStart,
+                                 bullSetupValid ? bullRunCisd : na, bullSetupValid ? bullCisdOrigin : na,
+                                 na, na, na, bullSetupValid ? bullSwingHigh : na, bullSetupValid ? bullSwingHighTime : na,
+                                 0, importance, bullDeliveryQuality)
+                            bullCandidates.push(fresh)
+                            if bullCandidates.size() > 64
+                                Candidate removed = bullCandidates.shift()
+                        else
+                            Candidate updated = bullCandidates.get(candidateIndex)
+                            updated.extreme := processedLow
+                            updated.extremeTime := processedTime
+                            updated.extremeBar := processedBarIndex
+                            // A deeper manipulation extreme refreshes anchors,
+                            // but deliberately does not restart startBar timing.
+                            updated.cisd := bullSetupValid ? bullRunCisd : na
+                            updated.cisdOriginTime := bullSetupValid ? bullCisdOrigin : na
+                            updated.cisdConfirmTime := na
+                            updated.cisdConfirmClose := na
+                            updated.cisdConfirmBar := na
+                            updated.swing := bullSetupValid ? bullSwingHigh : na
+                            updated.swingTime := bullSetupValid ? bullSwingHighTime : na
+                            updated.stage := 0
+                            updated.liquidityImportance := importance
+                            updated.deliveryQuality := bullDeliveryQuality
+                            bullCandidates.set(candidateIndex, updated)
+
+        if referenceHighTimes.size() > 0
+            for referenceIndex = 0 to referenceHighTimes.size() - 1
+                int referenceHighTime = referenceHighTimes.get(referenceIndex)
+                float referenceHigh = referenceHighPrices.get(referenceIndex)
+                float bearThreshold = referenceHigh + sweepTolerance
+                bool bearViolated = bearMeasure > bearThreshold
+                bool freshBearSweep = referenceHighTime < processedTime and bearViolated and
+                     not na(priorBearMeasure) and priorBearMeasure <= bearThreshold
+                if not arrayHasInt(consumedBearReferences, referenceHighTime)
+                    int candidateIndex = candidateIndexByReference(bearCandidates, referenceHighTime)
+                    bool createCandidate = na(candidateIndex) and freshBearSweep
+                    bool deepenCandidate = false
+                    if not na(candidateIndex)
+                        Candidate existing = bearCandidates.get(candidateIndex)
+                        deepenCandidate := bearViolated and processedHigh > existing.extreme
+                    if createCandidate or deepenCandidate
+                        int competitionStart = competitionFilterEnabled ? time(competitionTf)[1] : referenceHighTime
+                        int candidateCompetitionStart = createCandidate ? competitionStart : bearCandidates.get(candidateIndex).competitionStart
+                        bool swingInCompetition = not competitionFilterEnabled or higherTimeframeNative or relaxCompetitionSwingWindow or
+                             (not na(candidateCompetitionStart) and bearSwingLowTime >= candidateCompetitionStart)
+                        bool bearSetupValid = bearSetupBaseValid and swingInCompetition
+                        if createCandidate
+                            Candidate fresh = Candidate.new(-1, referenceHighTime, referenceHigh, processedTime, processedTime,
+                                 processedHigh, processedBarIndex, processedBarIndex, competitionStart,
+                                 bearSetupValid ? bearRunCisd : na, bearSetupValid ? bearCisdOrigin : na,
+                                 na, na, na, bearSetupValid ? bearSwingLow : na, bearSetupValid ? bearSwingLowTime : na,
+                                 0, importance, bearDeliveryQuality)
+                            bearCandidates.push(fresh)
+                            if bearCandidates.size() > 64
+                                Candidate removed = bearCandidates.shift()
+                        else
+                            Candidate updated = bearCandidates.get(candidateIndex)
+                            updated.extreme := processedHigh
+                            updated.extremeTime := processedTime
+                            updated.extremeBar := processedBarIndex
+                            // Keep the original first-sweep deadline intact.
+                            updated.cisd := bearSetupValid ? bearRunCisd : na
+                            updated.cisdOriginTime := bearSetupValid ? bearCisdOrigin : na
+                            updated.cisdConfirmTime := na
+                            updated.cisdConfirmClose := na
+                            updated.cisdConfirmBar := na
+                            updated.swing := bearSetupValid ? bearSwingLow : na
+                            updated.swingTime := bearSetupValid ? bearSwingLowTime : na
+                            updated.stage := 0
+                            updated.liquidityImportance := importance
+                            updated.deliveryQuality := bearDeliveryQuality
+                            bearCandidates.set(candidateIndex, updated)
+
+        // 15m/1H fix: a sweep can occur before the native delivery leg has fully
+        // formed. Keep an active stage-0 candidate eligible to acquire its CISD
+        // and opposing swing on later bars even if price never deepens the sweep.
+        // The original first-sweep timer is intentionally preserved, and once a
+        // candidate already has frozen structure it is not rewritten here.
+        if relaxCompetitionSwingWindow
+            if bullCandidates.size() > 0
+                for refreshIndex = 0 to bullCandidates.size() - 1
+                    Candidate pending = bullCandidates.get(refreshIndex)
+                    bool needsStructure = pending.stage == 0 and (na(pending.cisd) or na(pending.swing))
+                    bool afterSweepExtreme = processedTime > pending.extremeTime
+                    bool swingAllowed = not competitionFilterEnabled or higherTimeframeNative or relaxCompetitionSwingWindow or
+                         (not na(pending.competitionStart) and bullSwingHighTime >= pending.competitionStart)
+                    if needsStructure and afterSweepExtreme and bullSetupBaseValid and swingAllowed
+                        pending.cisd := bullRunCisd
+                        pending.cisdOriginTime := bullCisdOrigin
+                        pending.swing := bullSwingHigh
+                        pending.swingTime := bullSwingHighTime
+                        pending.deliveryQuality := bullDeliveryQuality
+                        bullCandidates.set(refreshIndex, pending)
+
+            if bearCandidates.size() > 0
+                for refreshIndex = 0 to bearCandidates.size() - 1
+                    Candidate pending = bearCandidates.get(refreshIndex)
+                    bool needsStructure = pending.stage == 0 and (na(pending.cisd) or na(pending.swing))
+                    bool afterSweepExtreme = processedTime > pending.extremeTime
+                    bool swingAllowed = not competitionFilterEnabled or higherTimeframeNative or relaxCompetitionSwingWindow or
+                         (not na(pending.competitionStart) and bearSwingLowTime >= pending.competitionStart)
+                    if needsStructure and afterSweepExtreme and bearSetupBaseValid and swingAllowed
+                        pending.cisd := bearRunCisd
+                        pending.cisdOriginTime := bearCisdOrigin
+                        pending.swing := bearSwingLow
+                        pending.swingTime := bearSwingLowTime
+                        pending.deliveryQuality := bearDeliveryQuality
+                        bearCandidates.set(refreshIndex, pending)
+
+        if bullCandidates.size() > 0
+            int candidateIndex = bullCandidates.size() - 1
+            while candidateIndex >= 0
+                Candidate candidate = bullCandidates.get(candidateIndex)
+                bool removeCandidate = false
+                bool expired = processedBarIndex - candidate.startBar > effectiveCandidateLifetime
+                // Sweep-to-CISD timing is anchored to the first sweep; deeper
+                // extremes never restart the rapid-reclaim deadline.
+                bool cisdExpired = requireRapidReclaim and candidate.stage == 0 and
+                     processedBarIndex - candidate.startBar > effectiveCisdLifetime
+                // Stage 1 is invalid when displacement cannot break the
+                // opposing swing within the configured rapid-break window.
+                bool swingBreakExpired = requireRapidSwingBreak and candidate.stage == 1 and
+                     not na(candidate.cisdConfirmBar) and
+                     processedBarIndex - candidate.cisdConfirmBar > effectiveSwingBreakBars
+                bool afterExtreme = processedTime > candidate.extremeTime
+
+                if expired or cisdExpired or swingBreakExpired
+                    removeCandidate := true
+                else if afterExtreme and not na(candidate.cisd) and not na(candidate.swing)
+                    if candidate.stage == 0 and processedClose > candidate.cisd
+                        candidate.stage := 1
+                        candidate.cisdConfirmTime := processedTime
+                        candidate.cisdConfirmClose := processedClose
+                        candidate.cisdConfirmBar := processedBarIndex
+
+                    bool swingBreached = candidate.stage == 1 and
+                         (swingBreachMode == "Body close" ? processedClose > candidate.swing : processedHigh > candidate.swing)
+                    if swingBreached
+                        float projectionRange = candidate.swing - candidate.extreme
+                        bool orientationValid = projectionRange > 0.0
+                        if orientationValid
+                            float normalizer = not na(nativeAtr) and nativeAtr > 0.0 ? nativeAtr : math.max(syminfo.mintick, projectionRange)
+                            float sweepDepth = math.max(0.0, candidate.referencePrice - candidate.extreme) / normalizer
+                            float cisdDisplacement = math.max(0.0, candidate.cisdConfirmClose - candidate.cisd) / normalizer
+                            float swingDisplacement = math.max(0.0, processedHigh - candidate.swing) / normalizer
+                            float candidateScore = candidate.liquidityImportance * 100.0 + candidate.deliveryQuality * 15.0 +
+                                 sweepDepth * 12.0 + cisdDisplacement * 10.0 + swingDisplacement * 8.0 +
+                                 projectionRange / normalizer * 5.0
+                            int winnerIndex = bullWinnerWindows.indexof(candidate.competitionStart)
+                            bool windowStillOpen = time(competitionTf)[1] == candidate.competitionStart
+                            bool moreExtremeCisd = winnerIndex != -1 and candidate.cisd < bullWinnerCisds.get(winnerIndex)
+                            bool winsCompetition = not competitionFilterEnabled or protectCompetitionExtremes or winnerIndex == -1 or
+                                 (windowStillOpen and (protectCompetitionExtremes ? moreExtremeCisd : candidateScore > bullWinnerScores.get(winnerIndex)))
+                            if winsCompetition
+                                if winnerIndex == -1
+                                    bullWinnerWindows.push(candidate.competitionStart)
+                                    bullWinnerScores.push(candidateScore)
+                                    bullWinnerCisds.push(candidate.cisd)
+                                    if bullWinnerWindows.size() > 40
+                                        bullWinnerWindows.shift()
+                                        bullWinnerScores.shift()
+                                        bullWinnerCisds.shift()
+                                else if not protectCompetitionExtremes or moreExtremeCisd
+                                    bullWinnerScores.set(winnerIndex, candidateScore)
+                                    bullWinnerCisds.set(winnerIndex, candidate.cisd)
+
+                                bullRevision += 1
+                                bullWindow := candidate.competitionStart
+                                bullConfirmTime := processedTime
+                                bullFirstSweepTime := candidate.firstSweepTime
+                                bullA0Time := candidate.swingTime
+                                bullA0 := candidate.swing
+                                bullA1Time := candidate.extremeTime
+                                bullA1 := candidate.extreme
+                                bullCisdOriginTime := candidate.cisdOriginTime
+                                bullCisdConfirmTime := candidate.cisdConfirmTime
+                                bullEventCisd := candidate.cisd
+                                bullReferenceTime := candidate.referenceTime
+                                bullReferencePrice := candidate.referencePrice
+                                bullEventScore := candidateScore
+                                rememberConsumedReference(consumedBullReferences, candidate.referenceTime)
+
+                        removeCandidate := true
+
+                if removeCandidate
+                    bullCandidates.remove(candidateIndex)
+                else
+                    bullCandidates.set(candidateIndex, candidate)
+                candidateIndex -= 1
+
+        if bearCandidates.size() > 0
+            int candidateIndex = bearCandidates.size() - 1
+            while candidateIndex >= 0
+                Candidate candidate = bearCandidates.get(candidateIndex)
+                bool removeCandidate = false
+                bool expired = processedBarIndex - candidate.startBar > effectiveCandidateLifetime
+                bool cisdExpired = requireRapidReclaim and candidate.stage == 0 and
+                     processedBarIndex - candidate.startBar > effectiveCisdLifetime
+                bool swingBreakExpired = requireRapidSwingBreak and candidate.stage == 1 and
+                     not na(candidate.cisdConfirmBar) and
+                     processedBarIndex - candidate.cisdConfirmBar > effectiveSwingBreakBars
+                bool afterExtreme = processedTime > candidate.extremeTime
+
+                if expired or cisdExpired or swingBreakExpired
+                    removeCandidate := true
+                else if afterExtreme and not na(candidate.cisd) and not na(candidate.swing)
+                    if candidate.stage == 0 and processedClose < candidate.cisd
+                        candidate.stage := 1
+                        candidate.cisdConfirmTime := processedTime
+                        candidate.cisdConfirmClose := processedClose
+                        candidate.cisdConfirmBar := processedBarIndex
+
+                    bool swingBreached = candidate.stage == 1 and
+                         (swingBreachMode == "Body close" ? processedClose < candidate.swing : processedLow < candidate.swing)
+                    if swingBreached
+                        float projectionRange = candidate.extreme - candidate.swing
+                        bool orientationValid = projectionRange > 0.0
+                        if orientationValid
+                            float normalizer = not na(nativeAtr) and nativeAtr > 0.0 ? nativeAtr : math.max(syminfo.mintick, projectionRange)
+                            float sweepDepth = math.max(0.0, candidate.extreme - candidate.referencePrice) / normalizer
+                            float cisdDisplacement = math.max(0.0, candidate.cisd - candidate.cisdConfirmClose) / normalizer
+                            float swingDisplacement = math.max(0.0, candidate.swing - processedLow) / normalizer
+                            float candidateScore = candidate.liquidityImportance * 100.0 + candidate.deliveryQuality * 15.0 +
+                                 sweepDepth * 12.0 + cisdDisplacement * 10.0 + swingDisplacement * 8.0 +
+                                 projectionRange / normalizer * 5.0
+                            int winnerIndex = bearWinnerWindows.indexof(candidate.competitionStart)
+                            bool windowStillOpen = time(competitionTf)[1] == candidate.competitionStart
+                            bool moreExtremeCisd = winnerIndex != -1 and candidate.cisd > bearWinnerCisds.get(winnerIndex)
+                            bool winsCompetition = not competitionFilterEnabled or protectCompetitionExtremes or winnerIndex == -1 or
+                                 (windowStillOpen and (protectCompetitionExtremes ? moreExtremeCisd : candidateScore > bearWinnerScores.get(winnerIndex)))
+                            if winsCompetition
+                                if winnerIndex == -1
+                                    bearWinnerWindows.push(candidate.competitionStart)
+                                    bearWinnerScores.push(candidateScore)
+                                    bearWinnerCisds.push(candidate.cisd)
+                                    if bearWinnerWindows.size() > 40
+                                        bearWinnerWindows.shift()
+                                        bearWinnerScores.shift()
+                                        bearWinnerCisds.shift()
+                                else if not protectCompetitionExtremes or moreExtremeCisd
+                                    bearWinnerScores.set(winnerIndex, candidateScore)
+                                    bearWinnerCisds.set(winnerIndex, candidate.cisd)
+
+                                bearRevision += 1
+                                bearWindow := candidate.competitionStart
+                                bearConfirmTime := processedTime
+                                bearFirstSweepTime := candidate.firstSweepTime
+                                bearA0Time := candidate.swingTime
+                                bearA0 := candidate.swing
+                                bearA1Time := candidate.extremeTime
+                                bearA1 := candidate.extreme
+                                bearCisdOriginTime := candidate.cisdOriginTime
+                                bearCisdConfirmTime := candidate.cisdConfirmTime
+                                bearEventCisd := candidate.cisd
+                                bearReferenceTime := candidate.referenceTime
+                                bearReferencePrice := candidate.referencePrice
+                                bearEventScore := candidateScore
+                                rememberConsumedReference(consumedBearReferences, candidate.referenceTime)
+
+                        removeCandidate := true
+
+                if removeCandidate
+                    bearCandidates.remove(candidateIndex)
+                else
+                    bearCandidates.set(candidateIndex, candidate)
+                candidateIndex -= 1
+
+    int bullPendingId = na
+    float bullPendingCisd = na
+    int latestBullPendingExtremeTime = na
+    if bullCandidates.size() > 0
+        for i = 0 to bullCandidates.size() - 1
+            Candidate candidate = bullCandidates.get(i)
+            if not na(candidate.cisd) and (na(latestBullPendingExtremeTime) or candidate.extremeTime > latestBullPendingExtremeTime)
+                bullPendingId := candidate.cisdOriginTime
+                bullPendingCisd := candidate.cisd
+                latestBullPendingExtremeTime := candidate.extremeTime
+
+    int bearPendingId = na
+    float bearPendingCisd = na
+    int latestBearPendingExtremeTime = na
+    if bearCandidates.size() > 0
+        for i = 0 to bearCandidates.size() - 1
+            Candidate candidate = bearCandidates.get(i)
+            if not na(candidate.cisd) and (na(latestBearPendingExtremeTime) or candidate.extremeTime > latestBearPendingExtremeTime)
+                bearPendingId := candidate.cisdOriginTime
+                bearPendingCisd := candidate.cisd
+                latestBearPendingExtremeTime := candidate.extremeTime
+
+    LayerSnapshot.new(
+         bullRevision, bullWindow, bullConfirmTime, bullFirstSweepTime,
+         bullA0Time, bullA0, bullA1Time, bullA1, bullCisdOriginTime, bullCisdConfirmTime, bullEventCisd,
+         bullReferenceTime, bullReferencePrice, bullEventScore,
+         bearRevision, bearWindow, bearConfirmTime, bearFirstSweepTime,
+         bearA0Time, bearA0, bearA1Time, bearA1, bearCisdOriginTime, bearCisdConfirmTime, bearEventCisd,
+         bearReferenceTime, bearReferencePrice, bearEventScore,
+         bullPendingId, bullPendingCisd, bearPendingId, bearPendingCisd,
+         processedTime, processedOpen, processedHigh, processedLow, processedClose,
+         bullCandidates.size(), bearCandidates.size(),
+         lastReferenceHighTime, lastReferenceHigh, lastReferenceLowTime, lastReferenceLow)
+
+// =============================================================================
+// LAYER CONFIGURATION AND VISIBILITY
+// =============================================================================
+
+layerEnabled(int layer) =>
+    layer == 0 ? layer0Master : layer == 1 ? layer1Master : layer == 2 ? layer2Master :
+     layer == 3 ? layer3Master : layer == 4 ? layer4Master : layer == 5 ? layer5Master : layer6Master
+
+layerLiquidityTf(int layer) =>
+    layer == 0 ? layer0LiquidityTf : layer == 1 ? layer1LiquidityTf : layer == 2 ? layer2LiquidityTf :
+     layer == 3 ? layer3LiquidityTf : layer == 4 ? layer4LiquidityTf : layer == 5 ? layer5LiquidityTf : layer6LiquidityTf
+
+layerConfirmationTf(int layer) =>
+    layer == 0 ? layer0ConfirmationTf : layer == 1 ? layer1ConfirmationTf : layer == 2 ? layer2ConfirmationTf :
+     layer == 3 ? layer3ConfirmationTf : layer == 4 ? layer4ConfirmationTf : layer == 5 ? layer5ConfirmationTf : layer6ConfirmationTf
+
+layerReferenceMode(int layer) =>
+    layer == 0 ? layer0ReferenceMode : layer == 1 ? layer1ReferenceMode : layer == 2 ? layer2ReferenceMode :
+     layer == 3 ? layer3ReferenceMode : layer == 4 ? layer4ReferenceMode : layer == 5 ? layer5ReferenceMode : layer6ReferenceMode
+
+layerNormalLookback(int layer) =>
+    layer == 0 ? layer0NormalLookback : layer == 1 ? layer1NormalLookback : layer == 2 ? layer2NormalLookback :
+     layer == 3 ? layer3NormalLookback : layer == 4 ? layer4NormalLookback : layer == 5 ? layer5NormalLookback : layer6NormalLookback
+
+layerLiquiditySwingStrength(int layer) =>
+    layer == 0 ? layer0SwingStrength : layer == 1 ? layer1SwingStrength : layer == 2 ? layer2SwingStrength :
+     layer == 3 ? layer3SwingStrength : layer == 4 ? layer4SwingStrength : layer == 5 ? layer5SwingStrength : layer6SwingStrength
+
+layerExtremeLength(int layer) =>
+    layer == 0 ? layer0ExtremeLength : layer == 1 ? layer1ExtremeLength : layer == 2 ? layer2ExtremeLength :
+     layer == 3 ? layer3ExtremeLength : layer == 4 ? layer4ExtremeLength : layer == 5 ? layer5ExtremeLength : layer6ExtremeLength
+
+layerCandidateLifetime(int layer) =>
+    layer == 0 ? layer0CandidateLifetime : layer == 1 ? layer1CandidateLifetime : layer == 2 ? layer2CandidateLifetime :
+     layer == 3 ? layer3CandidateLifetime : layer == 4 ? layer4CandidateLifetime : layer == 5 ? layer5CandidateLifetime : layer6CandidateLifetime
+
+layerCompetitionEnabled(int layer) =>
+    layer == 0 ? layer0CompetitionEnabled : layer == 1 ? layer1CompetitionEnabled : layer == 2 ? layer2CompetitionEnabled :
+     layer == 3 ? layer3CompetitionEnabled : layer == 4 ? layer4CompetitionEnabled : layer == 5 ? layer5CompetitionEnabled : layer6CompetitionEnabled
+
+layerCompetitionTf(int layer) =>
+    layer == 0 ? layer0CompetitionTf : layer == 1 ? layer1CompetitionTf : layer == 2 ? layer2CompetitionTf :
+     layer == 3 ? layer3CompetitionTf : layer == 4 ? layer4CompetitionTf : layer == 5 ? layer5CompetitionTf : layer6CompetitionTf
+
+layerCompetitionStart(int layer) =>
+    layer == 0 ? time(layer0CompetitionTf) : layer == 1 ? time(layer1CompetitionTf) : layer == 2 ? time(layer2CompetitionTf) :
+     layer == 3 ? time(layer3CompetitionTf) : layer == 4 ? time(layer4CompetitionTf) : layer == 5 ? time(layer5CompetitionTf) : time(layer6CompetitionTf)
+
+layerScanDepth(int layer) =>
+    layer == 0 ? layer0ScanDepth : layer == 1 ? layer1ScanDepth : layer == 2 ? layer2ScanDepth :
+     layer == 3 ? layer3ScanDepth : layer == 4 ? layer4ScanDepth : layer == 5 ? layer5ScanDepth : layer6ScanDepth
+
+layerRetentionBars(int layer) =>
+    layer == 0 ? layer0Retention : layer == 1 ? layer1Retention : layer == 2 ? layer2Retention :
+     layer == 3 ? layer3Retention : layer == 4 ? layer4Retention : layer == 5 ? layer5Retention : layer6Retention
+
+layerMaxTotal(int layer) =>
+    layer == 0 ? layer0MaxTotal : layer == 1 ? layer1MaxTotal : layer == 2 ? layer2MaxTotal :
+     layer == 3 ? layer3MaxTotal : layer == 4 ? layer4MaxTotal : layer == 5 ? layer5MaxTotal : layer6MaxTotal
+
+layerMaxBull(int layer) =>
+    layer == 0 ? layer0MaxBull : layer == 1 ? layer1MaxBull : layer == 2 ? layer2MaxBull :
+     layer == 3 ? layer3MaxBull : layer == 4 ? layer4MaxBull : layer == 5 ? layer5MaxBull : layer6MaxBull
+
+layerMaxBear(int layer) =>
+    layer == 0 ? layer0MaxBear : layer == 1 ? layer1MaxBear : layer == 2 ? layer2MaxBear :
+     layer == 3 ? layer3MaxBear : layer == 4 ? layer4MaxBear : layer == 5 ? layer5MaxBear : layer6MaxBear
+
+layerSelectionMode(int layer) =>
+    layer == 0 ? layer0SelectionMode : layer == 1 ? layer1SelectionMode : layer == 2 ? layer2SelectionMode :
+     layer == 3 ? layer3SelectionMode : layer == 4 ? layer4SelectionMode : layer == 5 ? layer5SelectionMode : layer6SelectionMode
+
+layerMarkerBars(int layer) =>
+    layer == 0 ? layer0MarkerBars : layer == 1 ? layer1MarkerBars : layer == 2 ? layer2MarkerBars :
+     layer == 3 ? layer3MarkerBars : layer == 4 ? layer4MarkerBars : layer == 5 ? layer5MarkerBars : layer6MarkerBars
+
+layerHistoricalOpacity(int layer) =>
+    layer == 0 ? layer0HistoricalOpacity : layer == 1 ? layer1HistoricalOpacity : layer == 2 ? layer2HistoricalOpacity :
+     layer == 3 ? layer3HistoricalOpacity : layer == 4 ? layer4HistoricalOpacity : layer == 5 ? layer5HistoricalOpacity : layer6HistoricalOpacity
+
+float chartSecondsRaw = timeframe.in_seconds(timeframe.period)
+int chartSeconds = na(chartSecondsRaw) ? 0 : int(chartSecondsRaw)
+int group1StartSeconds = safeTfSeconds(group1StartTf)
+int oneMinuteMaxSeconds = safeTfSeconds(layer6ConfirmationTf)
+int group1MaxSeconds = safeTfSeconds(group1MaxTf)
+int group3StartSeconds = safeTfSeconds(group3StartTf)
+int group4StartSeconds = safeTfSeconds(group4StartTf)
+int group5StartSeconds = safeTfSeconds(group5StartTf)
+bool chartBoundariesValid = group1StartSeconds <= oneMinuteMaxSeconds and oneMinuteMaxSeconds < group1MaxSeconds and
+     group1MaxSeconds < group3StartSeconds and group3StartSeconds < group4StartSeconds and group4StartSeconds < group5StartSeconds
+bool supportedChart = not na(chartSecondsRaw) and chartSeconds >= group1StartSeconds and chartBoundariesValid
+
+// The new 1m group is primary only on the 1m chart. Every pre-existing
+// preset keeps its original chart range and can still appear as MTF context.
+int mappedLayer = chartSeconds <= oneMinuteMaxSeconds ? 6 : chartSeconds <= group1MaxSeconds ? 0 :
+     chartSeconds < group3StartSeconds ? 1 : chartSeconds < group4StartSeconds ? 2 :
+     chartSeconds < group5StartSeconds ? 3 : 4
+
+layerPrimaryVisible(int layer) =>
+    bool primaryDaily = layer == 4 and mappedLayer == 4 and showDailyNativeInGroup5
+    bool legacyDaily = layer == 5 and mappedLayer == 4 and alsoShowLegacyDailyInGroup5
+    bool normalPrimary = layer == mappedLayer and layer != 4 and layer != 5
+    supportedChart and layerEnabled(layer) and (normalPrimary or primaryDaily or legacyDaily)
+
+layerMtfVisible(int layer) =>
+    int primaryConfirmationSeconds = safeTfSeconds(layerConfirmationTf(mappedLayer))
+    int candidateConfirmationSeconds = safeTfSeconds(layerConfirmationTf(layer))
+    bool activeLayer = layer >= 0 and layer <= 6 and layer != 5 and layerEnabled(layer)
+    supportedChart and showMtfSets and activeLayer and candidateConfirmationSeconds > primaryConfirmationSeconds
+
+layerVisible(int layer) =>
+    layerPrimaryVisible(layer) or layerMtfVisible(layer)
+
+layerConfigurationValid(int layer) =>
+    safeTfSeconds(layerLiquidityTf(layer)) >= safeTfSeconds(layerConfirmationTf(layer)) and
+     (not layerCompetitionEnabled(layer) or safeTfSeconds(layerCompetitionTf(layer)) > safeTfSeconds(layerConfirmationTf(layer)))
+
+// =============================================================================
+// PROJECTION STORAGE AND VISUALS
+// =============================================================================
+
+var array<Projection> projections = array.new<Projection>()
+var array<int> lastBullRevision = array.new_int(7, 0)
+var array<int> lastBearRevision = array.new_int(7, 0)
+var array<int> pendingBullId = array.new_int(7)
+var array<float> pendingBullCisd = array.new_float(7)
+var array<int> pendingBearId = array.new_int(7)
+var array<float> pendingBearCisd = array.new_float(7)
+var array<line> pendingBullLines = array.new_line(7)
+var array<line> pendingBearLines = array.new_line(7)
+var array<label> pendingBullLabels = array.new_label(7)
+var array<label> pendingBearLabels = array.new_label(7)
+var array<int> pendingBullDrawnId = array.new_int(7)
+var array<int> pendingBearDrawnId = array.new_int(7)
+var array<int> debugNativeTime = array.new_int(7)
+var array<int> debugBullCandidateCount = array.new_int(7, 0)
+var array<int> debugBearCandidateCount = array.new_int(7, 0)
+var array<int> debugReferenceHighTime = array.new_int(7)
+var array<int> debugReferenceLowTime = array.new_int(7)
+// Raised from 140 because retired projections now stay in memory as records.
+int GLOBAL_PROJECTION_LIMIT = 300
+
+buildRatios() =>
+    array<float> ratios = array.new<float>()
+    array<float> allRatios = array.from(0.0, 1.0, -1.0, -1.5, -2.0, -2.5, -3.5, -4.0)
+    for i = 0 to allRatios.size() - 1
+        float ratio = allRatios.get(i)
+        if ratioEnabled(ratio)
+            ratios.push(ratio)
+    ratios
+
+structureColor(int layer) =>
+    useChartForeground ? chart.fg_color : stdvColor
+
+deleteProjectionDrawings(Projection projection) =>
+    Projection result = projection
+    if result.ratioLines.size() > 0
+        for i = 0 to result.ratioLines.size() - 1
+            line.delete(result.ratioLines.get(i))
+    if result.ratioLabels.size() > 0
+        for i = 0 to result.ratioLabels.size() - 1
+            label ratioLabel = result.ratioLabels.get(i)
+            if not na(ratioLabel)
+                label.delete(ratioLabel)
+    if result.ratioBoxes.size() > 0
+        for i = 0 to result.ratioBoxes.size() - 1
+            box ratioBox = result.ratioBoxes.get(i)
+            if not na(ratioBox)
+                box.delete(ratioBox)
+    result.ratioLines.clear()
+    result.ratioLabels.clear()
+    result.ratioBoxes.clear()
+    if not na(result.liveMinusTwoBox)
+        box.delete(result.liveMinusTwoBox)
+        result.liveMinusTwoBox := na
+    if not na(result.liveMinusFourBox)
+        box.delete(result.liveMinusFourBox)
+        result.liveMinusFourBox := na
+    if not na(result.cisdLine)
+        line.delete(result.cisdLine)
+        result.cisdLine := na
+    if not na(result.cisdLabel)
+        label.delete(result.cisdLabel)
+        result.cisdLabel := na
+    result
+
+// -----------------------------------------------------------------------------
+// RETIRED-SETUP MARKERS ("ghosts")
+// A setup that dies used to vanish, which filtered the visible history down to
+// winners only. It now leaves one dotted line at the level where it died plus a
+// tiny tag. Kept in a separate ring so ghosts never consume the projection
+// drawing budget (max_lines_count / max_labels_count).
+// -----------------------------------------------------------------------------
+
+var array<line> ghostLines = array.new_line()
+var array<label> ghostLabels = array.new_label()
+const int GHOST_LIMIT = 60
+
+pushGhost(Projection projection) =>
+    if not na(projection.anchor1Time) and not na(projection.deadTime) and projection.deadTime > projection.anchor1Time
+        float ghostPrice = projection.status == 2 ?
+             projectionPrice(projection.anchor0, projection.anchor1, -4.0) : projection.anchor1
+        color ghostColor = projection.status == 2 ? color.new(color.gray, 40) : color.new(color.red, 40)
+        ghostLines.push(line.new(x1=projection.anchor1Time, y1=ghostPrice, x2=projection.deadTime, y2=ghostPrice,
+             xloc=xloc.bar_time, extend=extend.none, color=ghostColor, style=line.style_dotted, width=1))
+        ghostLabels.push(label.new(x=projection.deadTime, y=ghostPrice, text=projection.status == 2 ? "-4" : "x",
+             xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none,
+             color=color.new(color.white, 100), textcolor=ghostColor, size=size.tiny,
+             text_font_family=font.family_monospace))
+        if ghostLines.size() > GHOST_LIMIT
+            line.delete(ghostLines.shift())
+            label.delete(ghostLabels.shift())
+    0
+
+buildEventId(int layer, int direction, string liquidityTf, int referenceTime, float referencePrice,
+             int firstSweepTime, int anchor1Time, float anchor1, int cisdConfirmTime, int confirmationTime) =>
+    str.tostring(layer) + "|" + str.tostring(direction) + "|" + liquidityTf + "|" + str.tostring(referenceTime) + "|" +
+         str.tostring(referencePrice, format.mintick) + "|" + str.tostring(firstSweepTime) + "|" + str.tostring(anchor1Time) + "|" +
+         str.tostring(anchor1, format.mintick) + "|" + str.tostring(cisdConfirmTime) + "|" + str.tostring(confirmationTime)
+
+newProjection(int layer, int direction, int competitionStart, int revision, int confirmationTime, int firstSweepTime,
+              int anchor0Time, float anchor0, int anchor1Time, float anchor1,
+              int cisdOriginTime, int cisdConfirmTime, float cisd,
+              int referenceTime, float referencePrice, float winnerScore) =>
+    Projection.new(layer, direction, layerConfirmationTf(layer), layerLiquidityTf(layer), layerCompetitionTf(layer),
+         competitionStart, revision, confirmationTime, firstSweepTime, anchor0Time, anchor0, anchor1Time, anchor1,
+         cisdOriginTime, cisdConfirmTime, cisd, referenceTime, referencePrice,
+         buildEventId(layer, direction, layerLiquidityTf(layer), referenceTime, referencePrice, firstSweepTime,
+         anchor1Time, anchor1, cisdConfirmTime, confirmationTime),
+         math.abs(anchor0 - anchor1), winnerScore, 0, na, confirmationTime, na, na,
+         buildRatios(), array.new_line(), array.new_label(), array.new<box>(), na, na, na, na,
+         na)
+
+// Retired projections must never be treated as a slot for a new event, and must
+// never be replaced by one, so every finder below only looks at live status 0.
+findSameWinner(int layer, int direction, int competitionStart) =>
+    int found = na
+    if projections.size() > 0
+        for i = 0 to projections.size() - 1
+            Projection projection = projections.get(i)
+            if projection.layer == layer and projection.direction == direction and
+                 projection.competitionStart == competitionStart and projection.status == 0
+                found := i
+                break
+    found
+
+findNearDuplicate(int layer, int direction, int referenceTime, float referencePrice, int anchor1Time, float anchor0, float anchor1) =>
+    int found = na
+    float tolerance = duplicateToleranceTicks * syminfo.mintick
+    float newRange = math.abs(anchor0 - anchor1)
+    float newMinusTwoPointFive = projectionPrice(anchor0, anchor1, -2.5)
+    if projections.size() > 0
+        for i = 0 to projections.size() - 1
+            Projection projection = projections.get(i)
+            bool live = projection.layer == layer and projection.direction == direction and projection.status == 0
+            bool sameReference = live and
+                 projection.referenceTime == referenceTime and math.abs(projection.referencePrice - referencePrice) <= tolerance
+            bool sameSweep = live and projection.anchor1Time == anchor1Time
+            bool nearAnchors = live and
+                 math.abs(projection.anchor0 - anchor0) <= tolerance and math.abs(projection.anchor1 - anchor1) <= tolerance
+            float oldMinusTwoPointFive = projectionPrice(projection.anchor0, projection.anchor1, -2.5)
+            float objectiveTolerance = math.max(tolerance, math.min(newRange, projection.projectionRange) * 0.10)
+            bool overlappingObjective = not protectCompetitionExtremes and live and
+                 math.abs(oldMinusTwoPointFive - newMinusTwoPointFive) <= objectiveTolerance
+            if sameReference or sameSweep or nearAnchors or overlappingObjective
+                found := i
+                break
+    found
+
+upsertWinner(int layer, int direction, int revision, int competitionStart, int confirmationTime, int firstSweepTime,
+             int anchor0Time, float anchor0, int anchor1Time, float anchor1,
+             int cisdOriginTime, int cisdConfirmTime, float cisd,
+             int referenceTime, float referencePrice, float winnerScore) =>
+    bool valid = layerVisible(layer) and layerConfigurationValid(layer) and
+         not na(revision) and revision > 0 and not na(competitionStart) and not na(confirmationTime) and not na(firstSweepTime) and
+         not na(anchor0Time) and not na(anchor0) and not na(anchor1Time) and not na(anchor1) and
+         not na(cisdOriginTime) and not na(cisdConfirmTime) and not na(cisd) and
+         not na(referenceTime) and not na(referencePrice) and not na(winnerScore) and
+         (direction == 1 ? anchor0 > anchor1 : anchor0 < anchor1)
+
+    if valid
+        int sameWindow = findSameWinner(layer, direction, competitionStart)
+        int duplicate = findNearDuplicate(layer, direction, referenceTime, referencePrice, anchor1Time, anchor0, anchor1)
+        // With protected extremes enabled, keep distinct confirmed structures
+        // from the same window so the next extreme can be promoted immediately
+        // if the current one invalidates. Exact sweep/reference duplicates still
+        // collapse to one stored event.
+        int target = protectCompetitionExtremes ? duplicate : (not na(sameWindow) ? sameWindow : duplicate)
+        bool shouldUse = na(target)
+        if not na(target)
+            Projection old = projections.get(target)
+            bool replacesWindowExtreme = direction == 1 ? cisd < old.cisd : cisd > old.cisd
+            shouldUse := old.status != 0 or
+                 (not na(sameWindow) ? (protectCompetitionExtremes ? replacesWindowExtreme : winnerScore > old.selectionScore) :
+                 winnerScore > old.selectionScore)
+
+        if shouldUse
+            Projection fresh = newProjection(layer, direction, competitionStart, revision, confirmationTime, firstSweepTime,
+                 anchor0Time, anchor0, anchor1Time, anchor1, cisdOriginTime, cisdConfirmTime, cisd,
+                 referenceTime, referencePrice, winnerScore)
+            if not na(target)
+                Projection old = projections.get(target)
+                old := deleteProjectionDrawings(old)
+                projections.set(target, fresh)
+            else
+                projections.unshift(fresh)
+
+            // Retired projections are records, not display slots, so they do not
+            // count against the per-layer cap.
+            int storedForLayer = 0
+            int storedLimit = layer == 0 ? layer0MaxStored : layer == 1 ? layer1MaxStored : layer == 2 ? layer2MaxStored :
+                 layer == 3 ? layer3MaxStored : layer == 4 ? layer4MaxStored : layer == 5 ? layer5MaxStored : layer6MaxStored
+            if projections.size() > 0
+                for i = 0 to projections.size() - 1
+                    Projection storedProjection = projections.get(i)
+                    if storedProjection.layer == layer and storedProjection.status == 0
+                        storedForLayer += 1
+            if storedForLayer > storedLimit
+                int trimIndex = projections.size() - 1
+                while trimIndex >= 0 and storedForLayer > storedLimit
+                    Projection oldProjection = projections.get(trimIndex)
+                    if oldProjection.layer == layer and oldProjection.status == 0
+                        Projection removedLayerProjection = projections.remove(trimIndex)
+                        removedLayerProjection := deleteProjectionDrawings(removedLayerProjection)
+                        storedForLayer -= 1
+                    trimIndex -= 1
+
+            while projections.size() > GLOBAL_PROJECTION_LIMIT
+                Projection removed = projections.pop()
+                removed := deleteProjectionDrawings(removed)
+    0
+
+projectionRetentionMs(Projection projection) =>
+    safeTfSeconds(projection.confirmationTf) * 1000 * layerRetentionBars(projection.layer)
+
+projectionNearPrice(Projection projection) =>
+    float minusFour = projectionPrice(projection.anchor0, projection.anchor1, -4.0)
+    float lowBound = math.min(projection.anchor1, minusFour)
+    float highBound = math.max(projection.anchor1, minusFour)
+    float padding = projection.projectionRange * relevanceDistanceRanges
+    close >= lowBound - padding and close <= highBound + padding
+
+projectionObjectiveDistance(Projection projection) =>
+    float d2 = math.abs(close - projectionPrice(projection.anchor0, projection.anchor1, -2.0))
+    float d25 = math.abs(close - projectionPrice(projection.anchor0, projection.anchor1, -2.5))
+    float d35 = math.abs(close - projectionPrice(projection.anchor0, projection.anchor1, -3.5))
+    float d4 = math.abs(close - projectionPrice(projection.anchor0, projection.anchor1, -4.0))
+    math.min(math.min(d2, d25), math.min(d35, d4))
+
+projectionCompositeRank(Projection projection) =>
+    float safeRange = math.max(syminfo.mintick, projection.projectionRange)
+    float ageNativeBars = math.max(0.0, float(time - projection.confirmationTime) /
+         float(safeTfSeconds(projection.confirmationTf) * 1000))
+    float recencyScore = 100.0 / (1.0 + ageNativeBars / 50.0)
+    float objectiveScore = 80.0 / (1.0 + projectionObjectiveDistance(projection) / safeRange)
+    float unresolvedScore = projection.status == 0 ? 250.0 : 0.0
+    projection.selectionScore + unresolvedScore + recencyScore + objectiveScore
+
+selectedContains(array<int> selected, int projectionIndex) =>
+    selected.indexof(projectionIndex) != -1
+
+selectedDirectionCount(array<int> selected, int direction) =>
+    int count = 0
+    if selected.size() > 0
+        for i = 0 to selected.size() - 1
+            Projection selectedProjection = projections.get(selected.get(i))
+            if selectedProjection.direction == direction
+                count += 1
+    count
+
+bestProjectionIndex(array<int> candidates, array<int> selected, int layer, string criterion) =>
+    int bestIndex = na
+    float bestValue = na
+    int bestTime = na
+    if candidates.size() > 0
+        for i = 0 to candidates.size() - 1
+            int projectionIndex = candidates.get(i)
+            if not selectedContains(selected, projectionIndex)
+                Projection candidate = projections.get(projectionIndex)
+                int directionCap = candidate.direction == 1 ? layerMaxBull(layer) : layerMaxBear(layer)
+                bool directionAvailable = selectedDirectionCount(selected, candidate.direction) < directionCap
+                if directionAvailable
+                    float criterionValue = criterion == SELECT_RECENT ? float(candidate.confirmationTime) :
+                         criterion == SELECT_RANGE ? candidate.projectionRange :
+                         criterion == SELECT_CLOSEST ? -projectionObjectiveDistance(candidate) :
+                         projectionCompositeRank(candidate)
+                    if na(bestValue) or criterionValue > bestValue or
+                         (criterionValue == bestValue and (na(bestTime) or candidate.confirmationTime > bestTime))
+                        bestValue := criterionValue
+                        bestTime := candidate.confirmationTime
+                        bestIndex := projectionIndex
+    bestIndex
+
+newZoneBox(float anchor0, float anchor1, float ratioA, float ratioB,
+           int markerStart, int markerEnd, color zoneDraw) =>
+    float priceA = projectionPrice(anchor0, anchor1, ratioA)
+    float priceB = projectionPrice(anchor0, anchor1, ratioB)
+    box.new(left=markerStart, top=math.max(priceA, priceB), right=markerEnd, bottom=math.min(priceA, priceB),
+         xloc=xloc.bar_time, border_color=color.new(zoneDraw, 100), border_width=1, bgcolor=zoneDraw)
+
+updateZoneBox(box zoneBox, float anchor0, float anchor1, float ratioA, float ratioB,
+              int markerStart, int markerEnd, color zoneDraw) =>
+    float priceA = projectionPrice(anchor0, anchor1, ratioA)
+    float priceB = projectionPrice(anchor0, anchor1, ratioB)
+    box.set_left(zoneBox, markerStart)
+    box.set_right(zoneBox, markerEnd)
+    box.set_top(zoneBox, math.max(priceA, priceB))
+    box.set_bottom(zoneBox, math.min(priceA, priceB))
+    box.set_bgcolor(zoneBox, zoneDraw)
+    box.set_border_color(zoneBox, color.new(zoneDraw, 100))
+    0
+
+projectionTargetTouched(Projection projection, float ratio, float barHigh, float barLow) =>
+    float target = projectionPrice(projection.anchor0, projection.anchor1, ratio)
+    projection.direction == 1 ? barHigh >= target : barLow <= target
+
+renderProjection(Projection projection, bool visible, int transparency, int primaryWindowZoneRole, bool liveExtensionOwner) =>
+    Projection result = projection
+    if not visible
+        result := deleteProjectionDrawings(result)
+    else
+        color baseStructure = color.new(structureColor(result.layer), transparency)
+        color anchorDraw = color.new(anchorLineColor, transparency)
+        color cisdBase = result.direction == 1 ? bullishCisdColor : bearishCisdColor
+        color cisdDraw = color.new(cisdBase, math.min(85, transparency))
+        // On the chart's primary timeframe, make the absolute outer eligible
+        // CISDs own the darkest STDV boxes. Other primary CISDs are lighter.
+        // MTF behavior is unchanged.
+        int historicalZoneFade = int(math.round(transparency * 0.50))
+        int effectiveZoneTransparency = primaryWindowZoneRole == 1 ? stdvZoneTransparency :
+             primaryWindowZoneRole == -1 ? math.min(100, stdvZoneTransparency + math.max(12, historicalZoneFade)) :
+             math.min(100, stdvZoneTransparency + historicalZoneFade)
+        color zoneDraw = color.new(stdvZoneColor, effectiveZoneTransparency)
+        int nativeMs = safeTfSeconds(result.confirmationTf) * 1000
+        // Align the STDV markers with the manipulation anchor candle instead of
+        // shifting them right of the completed CISD/structure confirmation.
+        int markerStart = result.anchor1Time
+        int markerEnd = markerStart + layerMarkerBars(result.layer) * nativeMs
+        labelSize = labelSizeFromString(labelSizeInput)
+
+        if result.ratioLines.size() == 0
+            for i = 0 to result.ratios.size() - 1
+                float ratio = result.ratios.get(i)
+                float price = projectionPrice(result.anchor0, result.anchor1, ratio)
+                bool anchorRatio = ratio == 0.0 or ratio == 1.0
+                int x1 = ratio == 0.0 ? result.anchor0Time : ratio == 1.0 ? result.anchor1Time : markerStart
+                int x2 = anchorRatio ? result.confirmationTime + nativeMs : markerEnd
+                lineStyle = anchorRatio ? lineStyleFromString(anchorLineStyleInput) : lineStyleFromString(stdvLineStyleInput)
+                int width = anchorRatio ? anchorLineWidth : stdvLineWidth
+                color ratioDraw = anchorRatio ? anchorDraw : baseStructure
+                line ratioLine = line.new(x1=x1, y1=price, x2=x2, y2=price, xloc=xloc.bar_time,
+                     extend=extend.none, color=ratioDraw, style=lineStyle, width=width)
+                // The manipulation and swing anchors remain visible as lines,
+                // but their 0/1 text labels are intentionally never drawn.
+                label ratioLabel = na
+                if not anchorRatio
+                    int labelX = x1 - int(nativeMs * 0.25)
+                    ratioLabel := label.new(x=labelX, y=price, text=ratioText(ratio),
+                         xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none,
+                         color=color.new(color.white, 100), textcolor=ratioDraw, size=labelSize,
+                         text_font_family=font.family_monospace, textalign=text.align_right)
+                result.ratioLines.push(ratioLine)
+                result.ratioLabels.push(ratioLabel)
+
+            // Optional compact fills use the exact same short horizontal span
+            // as the STDV markers. They do not alter any projection level.
+            if fillMinusOneZone and showMinusOne and showMinusOnePointFive
+                result.ratioBoxes.push(newZoneBox(result.anchor0, result.anchor1, -1.0, -1.5, markerStart, markerEnd, zoneDraw))
+            if fillMinusTwoZone and showMinusTwo and showMinusTwoPointFive
+                result.ratioBoxes.push(newZoneBox(result.anchor0, result.anchor1, -2.0, -2.5, markerStart, markerEnd, zoneDraw))
+            if fillMinusThreePointFiveZone and showMinusThreePointFive and showMinusFour
+                result.ratioBoxes.push(newZoneBox(result.anchor0, result.anchor1, -3.5, -4.0, markerStart, markerEnd, zoneDraw))
+
+            int cisdEnd = extendConfirmedCisd ? (result.status == 0 ? time_close : result.endTime) : result.cisdConfirmTime + nativeMs
+            result.cisdLine := line.new(x1=result.cisdOriginTime, y1=result.cisd, x2=cisdEnd, y2=result.cisd,
+                 xloc=xloc.bar_time, extend=extend.none, color=cisdDraw, style=lineStyleFromString(cisdLineStyleInput), width=cisdLineWidth)
+            if showCisdText
+                result.cisdLabel := label.new(x=result.cisdOriginTime, y=result.cisd, text="CISD",
+                     xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none,
+                     color=color.new(color.white, 100), textcolor=cisdDraw, size=size.tiny)
+        else
+            for i = 0 to result.ratioLines.size() - 1
+                float ratio = result.ratios.get(i)
+                bool anchorRatio = ratio == 0.0 or ratio == 1.0
+                color ratioDraw = anchorRatio ? anchorDraw : baseStructure
+                line.set_color(result.ratioLines.get(i), ratioDraw)
+                label ratioLabel = result.ratioLabels.get(i)
+                if not na(ratioLabel)
+                    label.set_textcolor(ratioLabel, ratioDraw)
+                line.set_style(result.ratioLines.get(i), anchorRatio ? lineStyleFromString(anchorLineStyleInput) : lineStyleFromString(stdvLineStyleInput))
+                line.set_width(result.ratioLines.get(i), anchorRatio ? anchorLineWidth : stdvLineWidth)
+
+            int zoneIndex = 0
+            if fillMinusOneZone and showMinusOne and showMinusOnePointFive
+                if zoneIndex < result.ratioBoxes.size()
+                    updateZoneBox(result.ratioBoxes.get(zoneIndex), result.anchor0, result.anchor1, -1.0, -1.5, markerStart, markerEnd, zoneDraw)
+                zoneIndex += 1
+            if fillMinusTwoZone and showMinusTwo and showMinusTwoPointFive
+                if zoneIndex < result.ratioBoxes.size()
+                    updateZoneBox(result.ratioBoxes.get(zoneIndex), result.anchor0, result.anchor1, -2.0, -2.5, markerStart, markerEnd, zoneDraw)
+                zoneIndex += 1
+            if fillMinusThreePointFiveZone and showMinusThreePointFive and showMinusFour
+                if zoneIndex < result.ratioBoxes.size()
+                    updateZoneBox(result.ratioBoxes.get(zoneIndex), result.anchor0, result.anchor1, -3.5, -4.0, markerStart, markerEnd, zoneDraw)
+                zoneIndex += 1
+
+            int cisdEnd = extendConfirmedCisd ? (result.status == 0 ? time_close : result.endTime) : result.cisdConfirmTime + nativeMs
+            if not na(result.cisdLine)
+                line.set_x2(result.cisdLine, cisdEnd)
+                line.set_color(result.cisdLine, cisdDraw)
+                line.set_style(result.cisdLine, lineStyleFromString(cisdLineStyleInput))
+                line.set_width(result.cisdLine, cisdLineWidth)
+            if not na(result.cisdLabel)
+                label.set_textcolor(result.cisdLabel, cisdDraw)
+
+        // Live extension lifecycle for any CISD timeframe:
+        //   1) -2 to -2.5 is the only rail that extends at first.
+        //   2) The instant price touches the -2 boundary (enters that zone),
+        //      the first rail freezes at the touch candle and -3.5 to -4 appears.
+        //   3) The deep rail always starts at the original marker's right edge,
+        //      preventing the detached/gapped box that occurred when it started
+        //      at the objective-touch candle.
+        //   4) Existing -4 exhaustion still retires the entire projection.
+        bool useLiveExtensions = liveExtensionOwner and result.status == 0
+        color liveZoneDraw = color.new(stdvZoneColor, math.min(100, effectiveZoneTransparency + 9))
+
+        bool showLiveMinusTwo = useLiveExtensions and fillMinusTwoZone and showMinusTwo and showMinusTwoPointFive
+        int liveMinusTwoStart = markerEnd
+        int liveMinusTwoEnd = not na(result.firstObjectiveHitTime) ?
+             math.max(liveMinusTwoStart, result.firstObjectiveHitTime) : time_close
+        if showLiveMinusTwo and liveMinusTwoEnd > liveMinusTwoStart
+            if na(result.liveMinusTwoBox)
+                result.liveMinusTwoBox := newZoneBox(result.anchor0, result.anchor1, -2.0, -2.5,
+                     liveMinusTwoStart, liveMinusTwoEnd, liveZoneDraw)
+            else
+                updateZoneBox(result.liveMinusTwoBox, result.anchor0, result.anchor1, -2.0, -2.5,
+                     liveMinusTwoStart, liveMinusTwoEnd, liveZoneDraw)
+        else if not na(result.liveMinusTwoBox)
+            box.delete(result.liveMinusTwoBox)
+            result.liveMinusTwoBox := na
+
+        // Reveal the deep objective as soon as price ENTERS the -2/-2.5 zone.
+        // Its left edge is always markerEnd, never the later touch timestamp.
+        bool showLiveMinusFour = useLiveExtensions and fillMinusThreePointFiveZone and
+             showMinusThreePointFive and showMinusFour and not na(result.firstObjectiveHitTime)
+        int liveMinusFourStart = markerEnd
+        int liveMinusFourEnd = time_close
+        if showLiveMinusFour and liveMinusFourEnd > liveMinusFourStart
+            if na(result.liveMinusFourBox)
+                result.liveMinusFourBox := newZoneBox(result.anchor0, result.anchor1, -3.5, -4.0,
+                     liveMinusFourStart, liveMinusFourEnd, liveZoneDraw)
+            else
+                updateZoneBox(result.liveMinusFourBox, result.anchor0, result.anchor1, -3.5, -4.0,
+                     liveMinusFourStart, liveMinusFourEnd, liveZoneDraw)
+        else if not na(result.liveMinusFourBox)
+            box.delete(result.liveMinusFourBox)
+            result.liveMinusFourBox := na
+    result
+
+// =============================================================================
+// SNAPSHOT INGESTION AND NATIVE LIFECYCLE
+// =============================================================================
+
+ingestSnapshot(int layer, LayerSnapshot snapshot) =>
+    // security()/security_lower_tf() can return an undefined UDT on their
+    // first requested bar. Guard the object itself before reading any field.
+    if not na(snapshot)
+        if not na(snapshot.nativeTime)
+            int seenBull = lastBullRevision.get(layer)
+            int seenBear = lastBearRevision.get(layer)
+
+            if snapshot.bullRevision > seenBull
+                upsertWinner(layer, 1, snapshot.bullRevision, snapshot.bullWindow, snapshot.bullConfirmTime,
+                     snapshot.bullFirstSweepTime,
+                     snapshot.bullA0Time, snapshot.bullA0, snapshot.bullA1Time, snapshot.bullA1,
+                     snapshot.bullCisdOriginTime, snapshot.bullCisdConfirmTime, snapshot.bullCisd,
+                     snapshot.bullReferenceTime, snapshot.bullReferencePrice, snapshot.bullScore)
+                lastBullRevision.set(layer, snapshot.bullRevision)
+
+            if snapshot.bearRevision > seenBear
+                upsertWinner(layer, -1, snapshot.bearRevision, snapshot.bearWindow, snapshot.bearConfirmTime,
+                     snapshot.bearFirstSweepTime,
+                     snapshot.bearA0Time, snapshot.bearA0, snapshot.bearA1Time, snapshot.bearA1,
+                     snapshot.bearCisdOriginTime, snapshot.bearCisdConfirmTime, snapshot.bearCisd,
+                     snapshot.bearReferenceTime, snapshot.bearReferencePrice, snapshot.bearScore)
+                lastBearRevision.set(layer, snapshot.bearRevision)
+
+            pendingBullId.set(layer, snapshot.bullPendingId)
+            pendingBullCisd.set(layer, snapshot.bullPendingCisd)
+            pendingBearId.set(layer, snapshot.bearPendingId)
+            pendingBearCisd.set(layer, snapshot.bearPendingCisd)
+            debugNativeTime.set(layer, snapshot.nativeTime)
+            debugBullCandidateCount.set(layer, snapshot.bullCandidateCount)
+            debugBearCandidateCount.set(layer, snapshot.bearCandidateCount)
+            debugReferenceHighTime.set(layer, snapshot.debugReferenceHighTime)
+            debugReferenceLowTime.set(layer, snapshot.debugReferenceLowTime)
+
+            if projections.size() > 0
+                for i = 0 to projections.size() - 1
+                    Projection projection = projections.get(i)
+                    // Retired projections are frozen records: skip them entirely.
+                    if projection.layer == layer and projection.status == 0 and
+                         snapshot.nativeTime > projection.lastLifecycleTime
+                        // Track objective touches for every timeframe, even while a projection
+                        // is not currently an extension owner. The first stage fires on -2,
+                        // i.e. the instant price enters the -2 to -2.5 objective zone.
+                        if snapshot.nativeTime > projection.confirmationTime
+                            if na(projection.firstObjectiveHitTime) and
+                                 projectionTargetTouched(projection, -2.0, snapshot.nativeHigh, snapshot.nativeLow)
+                                projection.firstObjectiveHitTime := snapshot.nativeTime
+                            if na(projection.deepObjectiveHitTime) and
+                                 projectionTargetTouched(projection, -3.5, snapshot.nativeHigh, snapshot.nativeLow)
+                                projection.deepObjectiveHitTime := snapshot.nativeTime
+
+                        if snapshot.nativeTime > projection.confirmationTime
+                            float minusFour = projectionPrice(projection.anchor0, projection.anchor1, -4.0)
+                            bool wickInvalid = projection.direction == 1 ? snapshot.nativeLow < projection.anchor1 : snapshot.nativeHigh > projection.anchor1
+                            bool closeInvalid = projection.direction == 1 ? snapshot.nativeClose < projection.anchor1 : snapshot.nativeClose > projection.anchor1
+                            bool invalidated = anchorInvalidationMode == "Wick" ? wickInvalid :
+                                 anchorInvalidationMode == "Body close" ? closeInvalid : false
+                            bool minusFourWick = projection.direction == 1 ? snapshot.nativeHigh >= minusFour : snapshot.nativeLow <= minusFour
+                            bool minusFourClose = projection.direction == 1 ? snapshot.nativeClose >= minusFour : snapshot.nativeClose <= minusFour
+                            bool exhausted = minusFourCompletionMode == "Wick" ? minusFourWick :
+                                 minusFourCompletionMode == "Body close" ? minusFourClose : false
+                            if exhausted
+                                projection.status := 2
+                                projection.endTime := snapshot.nativeTime
+                            else if invalidated
+                                projection.status := 1
+                                projection.endTime := snapshot.nativeTime
+                        projection.lastLifecycleTime := snapshot.nativeTime
+                        projections.set(i, projection)
+    0
+
+ingestSnapshotArray(int layer, array<LayerSnapshot> snapshots) =>
+    // security_lower_tf() returns every closed native intrabar in chronological
+    // order. Revision de-duplication in ingestSnapshot() preserves each event
+    // identity when several native bars are compressed into one chart bar.
+    if snapshots.size() > 0
+        for snapshotIndex = 0 to snapshots.size() - 1
+            LayerSnapshot snapshot = snapshots.get(snapshotIndex)
+            ingestSnapshot(layer, snapshot)
+    0
+
+if layerVisible(0) and layerConfigurationValid(0)
+    if safeTfSeconds(layer0ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots0 = request.security_lower_tf(syminfo.tickerid, layer0ConfirmationTf,
+             detectLayer(layer0LiquidityTf, layer0ReferenceMode, layer0NormalLookback, layer0SwingStrength,
+             layer0ExtremeLength, layer0CandidateLifetime, layer0CisdLifetime, layer0CompetitionEnabled, layer0CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer0ScanDepth)
+        ingestSnapshotArray(0, snapshots0)
+    else
+        LayerSnapshot snapshot0 = request.security(syminfo.tickerid, layer0ConfirmationTf,
+             detectLayer(layer0LiquidityTf, layer0ReferenceMode, layer0NormalLookback, layer0SwingStrength,
+             layer0ExtremeLength, layer0CandidateLifetime, layer0CisdLifetime, layer0CompetitionEnabled, layer0CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer0ScanDepth)
+        ingestSnapshot(0, snapshot0)
+
+if layerVisible(1) and layerConfigurationValid(1)
+    if safeTfSeconds(layer1ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots1 = request.security_lower_tf(syminfo.tickerid, layer1ConfirmationTf,
+             detectLayer(layer1LiquidityTf, layer1ReferenceMode, layer1NormalLookback, layer1SwingStrength,
+             layer1ExtremeLength, layer1CandidateLifetime, layer1CisdLifetime, layer1CompetitionEnabled, layer1CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer1ScanDepth)
+        ingestSnapshotArray(1, snapshots1)
+    else
+        LayerSnapshot snapshot1 = request.security(syminfo.tickerid, layer1ConfirmationTf,
+             detectLayer(layer1LiquidityTf, layer1ReferenceMode, layer1NormalLookback, layer1SwingStrength,
+             layer1ExtremeLength, layer1CandidateLifetime, layer1CisdLifetime, layer1CompetitionEnabled, layer1CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer1ScanDepth)
+        ingestSnapshot(1, snapshot1)
+
+if layerVisible(2) and layerConfigurationValid(2)
+    if safeTfSeconds(layer2ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots2 = request.security_lower_tf(syminfo.tickerid, layer2ConfirmationTf,
+             detectLayer(layer2LiquidityTf, layer2ReferenceMode, layer2NormalLookback, layer2SwingStrength,
+             layer2ExtremeLength, layer2CandidateLifetime, layer2CisdLifetime, layer2CompetitionEnabled, layer2CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer2ScanDepth)
+        ingestSnapshotArray(2, snapshots2)
+    else
+        LayerSnapshot snapshot2 = request.security(syminfo.tickerid, layer2ConfirmationTf,
+             detectLayer(layer2LiquidityTf, layer2ReferenceMode, layer2NormalLookback, layer2SwingStrength,
+             layer2ExtremeLength, layer2CandidateLifetime, layer2CisdLifetime, layer2CompetitionEnabled, layer2CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer2ScanDepth)
+        ingestSnapshot(2, snapshot2)
+
+if layerVisible(3) and layerConfigurationValid(3)
+    if safeTfSeconds(layer3ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots3 = request.security_lower_tf(syminfo.tickerid, layer3ConfirmationTf,
+             detectLayer(layer3LiquidityTf, layer3ReferenceMode, layer3NormalLookback, layer3SwingStrength,
+             layer3ExtremeLength, layer3CandidateLifetime, layer3CisdLifetime, layer3CompetitionEnabled, layer3CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer3ScanDepth)
+        ingestSnapshotArray(3, snapshots3)
+    else
+        LayerSnapshot snapshot3 = request.security(syminfo.tickerid, layer3ConfirmationTf,
+             detectLayer(layer3LiquidityTf, layer3ReferenceMode, layer3NormalLookback, layer3SwingStrength,
+             layer3ExtremeLength, layer3CandidateLifetime, layer3CisdLifetime, layer3CompetitionEnabled, layer3CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer3ScanDepth)
+        ingestSnapshot(3, snapshot3)
+
+if layerVisible(4) and layerConfigurationValid(4)
+    if safeTfSeconds(layer4ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots4 = request.security_lower_tf(syminfo.tickerid, layer4ConfirmationTf,
+             detectLayer(layer4LiquidityTf, layer4ReferenceMode, layer4NormalLookback, layer4SwingStrength,
+             layer4ExtremeLength, layer4CandidateLifetime, layer4CisdLifetime, layer4CompetitionEnabled, layer4CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer4ScanDepth)
+        ingestSnapshotArray(4, snapshots4)
+    else
+        LayerSnapshot snapshot4 = request.security(syminfo.tickerid, layer4ConfirmationTf,
+             detectLayer(layer4LiquidityTf, layer4ReferenceMode, layer4NormalLookback, layer4SwingStrength,
+             layer4ExtremeLength, layer4CandidateLifetime, layer4CisdLifetime, layer4CompetitionEnabled, layer4CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer4ScanDepth)
+        ingestSnapshot(4, snapshot4)
+
+if layerVisible(5) and layerConfigurationValid(5)
+    if safeTfSeconds(layer5ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots5 = request.security_lower_tf(syminfo.tickerid, layer5ConfirmationTf,
+             detectLayer(layer5LiquidityTf, layer5ReferenceMode, layer5NormalLookback, layer5SwingStrength,
+             layer5ExtremeLength, layer5CandidateLifetime, layer5CisdLifetime, layer5CompetitionEnabled, layer5CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer5ScanDepth)
+        ingestSnapshotArray(5, snapshots5)
+    else
+        LayerSnapshot snapshot5 = request.security(syminfo.tickerid, layer5ConfirmationTf,
+             detectLayer(layer5LiquidityTf, layer5ReferenceMode, layer5NormalLookback, layer5SwingStrength,
+             layer5ExtremeLength, layer5CandidateLifetime, layer5CisdLifetime, layer5CompetitionEnabled, layer5CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer5ScanDepth)
+        ingestSnapshot(5, snapshot5)
+
+if layerVisible(6) and layerConfigurationValid(6)
+    if safeTfSeconds(layer6ConfirmationTf) < chartSeconds
+        array<LayerSnapshot> snapshots6 = request.security_lower_tf(syminfo.tickerid, layer6ConfirmationTf,
+             detectLayer(layer6LiquidityTf, layer6ReferenceMode, layer6NormalLookback, layer6SwingStrength,
+             layer6ExtremeLength, layer6CandidateLifetime, layer6CisdLifetime, layer6CompetitionEnabled, layer6CompetitionTf),
+             ignore_invalid_timeframe=true,
+             calc_bars_count=layer6ScanDepth)
+        ingestSnapshotArray(6, snapshots6)
+    else
+        LayerSnapshot snapshot6 = request.security(syminfo.tickerid, layer6ConfirmationTf,
+             detectLayer(layer6LiquidityTf, layer6ReferenceMode, layer6NormalLookback, layer6SwingStrength,
+             layer6ExtremeLength, layer6CandidateLifetime, layer6CisdLifetime, layer6CompetitionEnabled, layer6CompetitionTf),
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=layer6ScanDepth)
+        ingestSnapshot(6, snapshot6)
+
+// -----------------------------------------------------------------------------
+// C1 — REALTIME / RELOAD PARITY
+//
+// Wick rules used to be evaluated against the live chart bar, so a projection
+// could be killed by an intrabar spike. That decision is irreversible: the
+// array state survives every tick of the bar, and a reload replays the bar with
+// barstate.isconfirmed = true. The two paths could therefore disagree.
+//
+// Historical bars and the live bar are now both finalised once per closed
+// candle. Objective touches are still tracked intrabar because they are
+// informational only and cannot destroy a projection.
+// -----------------------------------------------------------------------------
+
+bool liveBarUnconfirmed = barstate.islast and not barstate.isconfirmed
+
+if projections.size() > 0
+    int lifecycleIndex = projections.size() - 1
+    while lifecycleIndex >= 0
+        Projection projection = projections.get(lifecycleIndex)
+        bool chartCanInvalidateLive = chartSeconds <= safeTfSeconds(projection.confirmationTf)
+        bool afterConfirmation = time > projection.confirmationTime
+        if projection.status == 0 and chartCanInvalidateLive and afterConfirmation
+            if na(projection.firstObjectiveHitTime) and projectionTargetTouched(projection, -2.0, high, low)
+                projection.firstObjectiveHitTime := time
+            if na(projection.deepObjectiveHitTime) and projectionTargetTouched(projection, -3.5, high, low)
+                projection.deepObjectiveHitTime := time
+
+            if not liveBarUnconfirmed
+                float minusFour = projectionPrice(projection.anchor0, projection.anchor1, -4.0)
+                bool anchorWickThrough = anchorInvalidationMode == "Wick" and
+                     (projection.direction == 1 ? low < projection.anchor1 : high > projection.anchor1)
+                bool minusFourWickThrough = minusFourCompletionMode == "Wick" and
+                     (projection.direction == 1 ? high >= minusFour : low <= minusFour)
+                if minusFourWickThrough
+                    projection.status := 2
+                    projection.endTime := time
+                else if anchorWickThrough
+                    projection.status := 1
+                    projection.endTime := time
+            projections.set(lifecycleIndex, projection)
+
+        // Retire, never delete. A dead setup keeps its record and leaves one
+        // dotted ghost marker at the level where it died, so the chart cannot
+        // silently show only the winners.
+        Projection checkedProjection = projections.get(lifecycleIndex)
+        if checkedProjection.status != 0 and na(checkedProjection.deadTime)
+            checkedProjection := deleteProjectionDrawings(checkedProjection)
+            checkedProjection.deadTime := nz(checkedProjection.endTime, time)
+            if showInvalidatedSetups
+                pushGhost(checkedProjection)
+            projections.set(lifecycleIndex, checkedProjection)
+        lifecycleIndex -= 1
+
+// =============================================================================
+// PENDING CISD VISUALS
+// =============================================================================
+
+if barstate.islast
+    for layer = 0 to 6
+        bool visibleLayer = layerPrimaryVisible(layer) and layerConfigurationValid(layer)
+        int bullId = pendingBullId.get(layer)
+        float bullCisd = pendingBullCisd.get(layer)
+        int bearId = pendingBearId.get(layer)
+        float bearCisd = pendingBearCisd.get(layer)
+
+        line bullLine = pendingBullLines.get(layer)
+        label bullLabel = pendingBullLabels.get(layer)
+        int bullDrawnId = pendingBullDrawnId.get(layer)
+        bool showBull = visibleLayer and showPendingCisd and not na(bullId) and not na(bullCisd)
+        if not showBull
+            if not na(bullLine)
+                line.delete(bullLine)
+                pendingBullLines.set(layer, na)
+            if not na(bullLabel)
+                label.delete(bullLabel)
+                pendingBullLabels.set(layer, na)
+            pendingBullDrawnId.set(layer, na)
+        else if na(bullLine) or bullId != bullDrawnId
+            if not na(bullLine)
+                line.delete(bullLine)
+            if not na(bullLabel)
+                label.delete(bullLabel)
+            line freshBullLine = line.new(x1=bullId, y1=bullCisd, x2=time_close, y2=bullCisd,
+                 xloc=xloc.bar_time, extend=extend.right, color=bullishCisdColor, style=line.style_dashed, width=1)
+            label freshBullLabel = label.new(x=time_close, y=bullCisd, text="forming CISD",
+                 xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none,
+                 color=color.new(color.white, 100), textcolor=bullishCisdColor, size=size.tiny)
+            pendingBullLines.set(layer, freshBullLine)
+            pendingBullLabels.set(layer, freshBullLabel)
+            pendingBullDrawnId.set(layer, bullId)
+        else
+            line.set_x2(bullLine, time_close)
+            line.set_y1(bullLine, bullCisd)
+            line.set_y2(bullLine, bullCisd)
+            if not na(bullLabel)
+                label.set_xy(bullLabel, time_close, bullCisd)
+                label.set_textcolor(bullLabel, bullishCisdColor)
+
+        line bearLine = pendingBearLines.get(layer)
+        label bearLabel = pendingBearLabels.get(layer)
+        int bearDrawnId = pendingBearDrawnId.get(layer)
+        bool showBear = visibleLayer and showPendingCisd and not na(bearId) and not na(bearCisd)
+        if not showBear
+            if not na(bearLine)
+                line.delete(bearLine)
+                pendingBearLines.set(layer, na)
+            if not na(bearLabel)
+                label.delete(bearLabel)
+                pendingBearLabels.set(layer, na)
+            pendingBearDrawnId.set(layer, na)
+        else if na(bearLine) or bearId != bearDrawnId
+            if not na(bearLine)
+                line.delete(bearLine)
+            if not na(bearLabel)
+                label.delete(bearLabel)
+            line freshBearLine = line.new(x1=bearId, y1=bearCisd, x2=time_close, y2=bearCisd,
+                 xloc=xloc.bar_time, extend=extend.right, color=bearishCisdColor, style=line.style_dashed, width=1)
+            label freshBearLabel = label.new(x=time_close, y=bearCisd, text="forming CISD",
+                 xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none,
+                 color=color.new(color.white, 100), textcolor=bearishCisdColor, size=size.tiny)
+            pendingBearLines.set(layer, freshBearLine)
+            pendingBearLabels.set(layer, freshBearLabel)
+            pendingBearDrawnId.set(layer, bearId)
+        else
+            line.set_x2(bearLine, time_close)
+            line.set_y1(bearLine, bearCisd)
+            line.set_y2(bearLine, bearCisd)
+            if not na(bearLabel)
+                label.set_xy(bearLabel, time_close, bearCisd)
+                label.set_textcolor(bearLabel, bearishCisdColor)
+
+// =============================================================================
+// RELEVANCE, CAPS, FADING, AND RENDERING
+// =============================================================================
+
+var array<bool> selectedProjection = array.new_bool()
+var array<bool> selectedMtfProjection = array.new_bool()
+selectedProjection.clear()
+selectedMtfProjection.clear()
+if projections.size() > 0
+    for i = 0 to projections.size() - 1
+        selectedProjection.push(false)
+        selectedMtfProjection.push(false)
+
+    // The primary chart group reserves its two outermost eligible CISDs first.
+    // This is intentionally independent of the competition-window boundary:
+    // the absolute lowest and highest valid CISDs survive a smaller visible cap.
+    // MTF groups are selected separately below and keep their existing behavior.
+    array<int> primaryLowestExtremeIndex = array.new_int(7)
+    array<int> primaryHighestExtremeIndex = array.new_int(7)
+    for layer = 0 to 6
+        if layerPrimaryVisible(layer)
+            int activeCompetitionStart = layerCompetitionStart(layer)
+            array<int> candidates = array.new_int()
+            for i = 0 to projections.size() - 1
+                Projection projection = projections.get(i)
+                bool withinRetention = time <= projection.confirmationTime + projectionRetentionMs(projection)
+                bool unresolvedAndRelevant = projection.status == 0 and
+                     (withinRetention or projectionNearPrice(projection))
+                bool protectedWindowSet = protectCompetitionExtremes and projection.status == 0 and
+                     projection.competitionStart == activeCompetitionStart
+                if projection.layer == layer and (unresolvedAndRelevant or protectedWindowSet)
+                    candidates.push(i)
+
+            array<int> selected = array.new_int()
+            int effectiveMaxTotal = layerMaxTotal(layer)
+
+            // Reserve the first two slots for the absolute lowest and highest
+            // eligible CISDs on the primary/current timeframe, regardless of
+            // direction or which competition window originally produced them.
+            if protectCompetitionExtremes and candidates.size() > 0
+                int protectedLow = na
+                int protectedHigh = na
+                float lowestCisd = na
+                float highestCisd = na
+                for candidatePosition = 0 to candidates.size() - 1
+                    int candidateIndex = candidates.get(candidatePosition)
+                    Projection candidateProjection = projections.get(candidateIndex)
+                    if na(lowestCisd) or candidateProjection.cisd < lowestCisd
+                        lowestCisd := candidateProjection.cisd
+                        protectedLow := candidateIndex
+                    if na(highestCisd) or candidateProjection.cisd > highestCisd
+                        highestCisd := candidateProjection.cisd
+                        protectedHigh := candidateIndex
+
+                if not na(protectedLow)
+                    selected.push(protectedLow)
+                    primaryLowestExtremeIndex.set(layer, protectedLow)
+                if not na(protectedHigh)
+                    primaryHighestExtremeIndex.set(layer, protectedHigh)
+                    if not selectedContains(selected, protectedHigh)
+                        selected.push(protectedHigh)
+
+            int targetCount = math.min(effectiveMaxTotal, candidates.size())
+            string selectionMode = layerSelectionMode(layer)
+            if selectionMode == SELECT_HYBRID
+                for pick = 0 to 1
+                    if selected.size() < targetCount
+                        int bestRecent = bestProjectionIndex(candidates, selected, layer, SELECT_RECENT)
+                        if not na(bestRecent)
+                            selected.push(bestRecent)
+                for pick = 0 to 1
+                    if selected.size() < targetCount
+                        int bestStrong = bestProjectionIndex(candidates, selected, layer, SELECT_SCORE)
+                        if not na(bestStrong)
+                            selected.push(bestStrong)
+                for fill = 0 to 9
+                    if selected.size() < targetCount
+                        int bestFill = bestProjectionIndex(candidates, selected, layer, SELECT_SCORE)
+                        if not na(bestFill)
+                            selected.push(bestFill)
+            else
+                for pick = 0 to 9
+                    if selected.size() < targetCount
+                        int best = bestProjectionIndex(candidates, selected, layer, selectionMode)
+                        if not na(best)
+                            selected.push(best)
+
+            if selected.size() > 0
+                for i = 0 to selected.size() - 1
+                    selectedProjection.set(selected.get(i), true)
+
+
+    // Build one newest active projection per eligible higher-timeframe group.
+    // Then cap the number of displayed MTF groups instead of showing all of them.
+    if showMtfSets
+        array<int> mtfLayers = array.new_int()
+        array<int> mtfProjectionIndices = array.new_int()
+        array<int> mtfConfirmationTimes = array.new_int()
+
+        for layer = 0 to 6
+            if layerMtfVisible(layer)
+                int newestProjectionIndex = na
+                int newestConfirmationTime = na
+                for i = 0 to projections.size() - 1
+                    Projection projection = projections.get(i)
+                    if projection.layer == layer and projection.status == 0 and
+                         (na(newestConfirmationTime) or projection.confirmationTime > newestConfirmationTime)
+                        newestProjectionIndex := i
+                        newestConfirmationTime := projection.confirmationTime
+                if not na(newestProjectionIndex)
+                    mtfLayers.push(layer)
+                    mtfProjectionIndices.push(newestProjectionIndex)
+                    mtfConfirmationTimes.push(newestConfirmationTime)
+
+        int mtfTargetCount = math.min(maxMtfGroups, mtfLayers.size())
+        array<int> selectedMtfPositions = array.new_int()
+
+        // Hybrid reserves the first slot for the nearest higher confirmation
+        // timeframe, then fills the rest by recency. Nearest and Most recent
+        // apply the same criterion to every slot.
+        if mtfSelectionMode == MTF_HYBRID and mtfTargetCount > 0
+            int nearestPosition = na
+            int nearestSeconds = na
+            for position = 0 to mtfLayers.size() - 1
+                int candidateSeconds = safeTfSeconds(layerConfirmationTf(mtfLayers.get(position)))
+                if na(nearestSeconds) or candidateSeconds < nearestSeconds
+                    nearestSeconds := candidateSeconds
+                    nearestPosition := position
+            if not na(nearestPosition)
+                selectedMtfPositions.push(nearestPosition)
+
+        for pick = 0 to 4
+            if selectedMtfPositions.size() < mtfTargetCount
+                int bestPosition = na
+                int bestTime = na
+                int bestSeconds = na
+                for position = 0 to mtfLayers.size() - 1
+                    if selectedMtfPositions.indexof(position) == -1
+                        int candidateTime = mtfConfirmationTimes.get(position)
+                        int candidateSeconds = safeTfSeconds(layerConfirmationTf(mtfLayers.get(position)))
+                        bool chooseByNearest = mtfSelectionMode == MTF_NEAREST
+                        bool better = chooseByNearest ?
+                             (na(bestSeconds) or candidateSeconds < bestSeconds or
+                              (candidateSeconds == bestSeconds and (na(bestTime) or candidateTime > bestTime))) :
+                             (na(bestTime) or candidateTime > bestTime or
+                              (candidateTime == bestTime and (na(bestSeconds) or candidateSeconds < bestSeconds)))
+                        if better
+                            bestPosition := position
+                            bestTime := candidateTime
+                            bestSeconds := candidateSeconds
+                if not na(bestPosition)
+                    selectedMtfPositions.push(bestPosition)
+
+        if selectedMtfPositions.size() > 0
+            for selectedPositionIndex = 0 to selectedMtfPositions.size() - 1
+                int selectedPosition = selectedMtfPositions.get(selectedPositionIndex)
+                int selectedMtfIndex = mtfProjectionIndices.get(selectedPosition)
+                selectedProjection.set(selectedMtfIndex, true)
+                selectedMtfProjection.set(selectedMtfIndex, true)
+
+    // Live-extension crowd control: ONLY the chart's primary/current CISD group
+    // can own long objective rails. Higher-timeframe CISDs may still render their
+    // normal compact projection markers, but never receive live extensions.
+    // Maximum live rails on the chart: newest active bull + newest active bear.
+    int livePrimaryBullIndex = na
+    int livePrimaryBearIndex = na
+    int livePrimaryBullTime = na
+    int livePrimaryBearTime = na
+
+    for i = 0 to projections.size() - 1
+        if selectedProjection.get(i)
+            Projection liveCandidate = projections.get(i)
+            bool currentTfCandidate = liveCandidate.status == 0 and layerPrimaryVisible(liveCandidate.layer) and
+                 not selectedMtfProjection.get(i)
+            if currentTfCandidate
+                if liveCandidate.direction == 1 and
+                     (na(livePrimaryBullTime) or liveCandidate.confirmationTime > livePrimaryBullTime)
+                    livePrimaryBullIndex := i
+                    livePrimaryBullTime := liveCandidate.confirmationTime
+                if liveCandidate.direction == -1 and
+                     (na(livePrimaryBearTime) or liveCandidate.confirmationTime > livePrimaryBearTime)
+                    livePrimaryBearIndex := i
+                    livePrimaryBearTime := liveCandidate.confirmationTime
+
+    for i = 0 to projections.size() - 1
+        Projection projection = projections.get(i)
+        // Retired setups already had their drawings removed when they died and
+        // are represented by a ghost. Nothing left to render here.
+        if projection.status == 0
+            bool visible = selectedProjection.get(i)
+            int newerSelected = 0
+            if visible
+                for j = 0 to projections.size() - 1
+                    if i != j and selectedProjection.get(j)
+                        Projection other = projections.get(j)
+                        if other.layer == projection.layer and other.confirmationTime > projection.confirmationTime
+                            newerSelected += 1
+            int transparency = newerSelected == 0 ? 0 :
+                 math.min(90, layerHistoricalOpacity(projection.layer) + (newerSelected - 1) * 8)
+
+            // Role: 1 = absolute primary-layer outer extreme, -1 = other primary
+            // projection, 0 = MTF/other behavior. Extreme STDV boxes stay darkest.
+            int primaryWindowZoneRole = 0
+            if protectCompetitionExtremes and layerPrimaryVisible(projection.layer)
+                int lowestExtremeIndex = primaryLowestExtremeIndex.get(projection.layer)
+                int highestExtremeIndex = primaryHighestExtremeIndex.get(projection.layer)
+                bool isPrimaryExtreme = i == lowestExtremeIndex or i == highestExtremeIndex
+                primaryWindowZoneRole := isPrimaryExtreme ? 1 : -1
+
+            bool liveExtensionOwner = i == livePrimaryBullIndex or i == livePrimaryBearIndex
+            projection := renderProjection(projection, visible, transparency, primaryWindowZoneRole, liveExtensionOwner)
+            projections.set(i, projection)
+
+// =============================================================================
+// OPTIONAL COMPACT STATUS TABLE
+// =============================================================================
+
+var table statusTable = table.new(position.top_right, 7, 8, border_width=1)
+
+if barstate.islast
+    if showStatusTable
+        table.cell(statusTable, 0, 0, "Layer", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        table.cell(statusTable, 1, 0, "Visible", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        table.cell(statusTable, 2, 0, "Native", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        table.cell(statusTable, 3, 0, "Refs", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        table.cell(statusTable, 4, 0, "Pending", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        table.cell(statusTable, 5, 0, "Bull rev", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        table.cell(statusTable, 6, 0, "Bear rev", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+        for layer = 0 to 6
+            table.cell(statusTable, 0, layer + 1, timeframeText(layerConfirmationTf(layer)))
+            table.cell(statusTable, 1, layer + 1, layerVisible(layer) and layerConfigurationValid(layer) ? "yes" : "no")
+            table.cell(statusTable, 2, layer + 1, na(debugNativeTime.get(layer)) ? "na" : str.format_time(debugNativeTime.get(layer), "MM-dd HH:mm"))
+            table.cell(statusTable, 3, layer + 1, (na(debugReferenceHighTime.get(layer)) ? "-" : "H") + "/" + (na(debugReferenceLowTime.get(layer)) ? "-" : "L"))
+            table.cell(statusTable, 4, layer + 1, str.tostring(debugBullCandidateCount.get(layer)) + "/" + str.tostring(debugBearCandidateCount.get(layer)))
+            table.cell(statusTable, 5, layer + 1, str.tostring(lastBullRevision.get(layer)))
+            table.cell(statusTable, 6, layer + 1, str.tostring(lastBearRevision.get(layer)))
+    else
+        table.clear(statusTable, 0, 0, 6, 7)
