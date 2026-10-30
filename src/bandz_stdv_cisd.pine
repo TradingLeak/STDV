@@ -127,6 +127,7 @@ type Projection
     line tpLine                    // v3
     line tpLine2                   // v3
     bool tpMarked                  // v3: first objective already tagged
+    bool ghosted                   // v4: retired set already reduced to a ghost stub
 
 // =============================================================================
 // INPUTS
@@ -384,9 +385,12 @@ int cisdLineWidth = input.int(2, "Thickness", minval=1, maxval=4, inline="cisd_l
 bool showCisdText = input.bool(false, "Show CISD text", group=GROUP_VISUAL)
 bool showPendingCisd = input.bool(false, "Show forming CISD", group=GROUP_VISUAL)
 // v2: retired setups stay on the chart instead of silently disappearing.
-bool showInvalidatedSetups = input.bool(true, "Show invalidated / completed sets", group=GROUP_VISUAL,
-     tooltip="A setup that is invalidated or runs to -4 keeps a dotted marker at the level where it died. Turn this off to hide the failures, but the statistics are still recorded.")
-color invalidatedSetupColor = input.color(color.rgb(120, 130, 145), "Invalidated / completed sets", inline="ghost", group=GROUP_VISUAL)
+bool showInvalidatedSetups = input.bool(true, "Show retired sets in full", group=GROUP_VISUAL,
+     tooltip="A retired setup is no longer reduced to a marker: it keeps every anchor, level, zone and CISD line on the chart, painted in the retired palette. Objective levels (-1 to -4) are repainted with their own colour so a dead setup's targets can never be read as live. Turn this off to hide the failures, but the statistics are still recorded.")
+color invalidatedSetupColor = input.color(color.rgb(120, 130, 145), "Retired structure", inline="ghost", group=GROUP_VISUAL)
+color retiredObjectiveColor = input.color(color.rgb(214, 158, 46), "Retired objectives", inline="ghost", group=GROUP_VISUAL)
+int deadDrawLimit = input.int(12, "Retired sets drawn in full", minval=0, maxval=40, group=GROUP_VISUAL,
+     tooltip="How many of the newest retired setups keep their complete drawing. Each full set costs roughly 17 drawings (lines, labels, zones), so raise this slowly to stay inside the 500-drawing limit. Older retired setups fall back to one ghost mark. 0 = ghost marks only.")
 
 string GROUP_SIGNALS = "Buy / Sell signals"
 bool showSignals = input.bool(true, "BUY / SELL confirmation", group=GROUP_SIGNALS,
@@ -1478,7 +1482,7 @@ newProjection(int layer, int direction, int competitionStart, int revision, int 
          anchor1Time, anchor1, cisdConfirmTime, confirmationTime),
          math.abs(anchor0 - anchor1), winnerScore, 0, na, confirmationTime, na, na,
          buildRatios(), array.new_line(), array.new_label(), array.new<box>(), na, na, na, na,
-         na, entryPrice, na, na, na, na, false)
+         na, entryPrice, na, na, na, na, false, false)
 
 // Retired projections must never be treated as a slot for a new event, and must
 // never be replaced by one, so every finder below only looks at live status 0.
@@ -1669,6 +1673,12 @@ renderProjection(Projection projection, bool visible, int transparency, int prim
     if not visible
         result := deleteProjectionDrawings(result)
     else
+        // v4: a retired set keeps its complete geometry (anchors, levels, zones
+        // and CISD) instead of collapsing to a single marker. Only the objective
+        // levels are repainted, so the targets of a dead setup can never be read
+        // as the targets of a live one.
+        bool deadSetup = result.status != 0
+        int retiredFade = math.min(88, transparency + 32)
         color baseStructure = color.new(structureColor(result.layer), transparency)
         color anchorDraw = color.new(anchorLineColor, transparency)
         color cisdBase = result.direction == 1 ? bullishCisdColor : bearishCisdColor
@@ -1681,6 +1691,13 @@ renderProjection(Projection projection, bool visible, int transparency, int prim
              primaryWindowZoneRole == -1 ? math.min(100, stdvZoneTransparency + math.max(12, historicalZoneFade)) :
              math.min(100, stdvZoneTransparency + historicalZoneFade)
         color zoneDraw = color.new(stdvZoneColor, effectiveZoneTransparency)
+        color objectiveDraw = baseStructure
+        if deadSetup
+            baseStructure := color.new(invalidatedSetupColor, retiredFade)
+            anchorDraw := color.new(invalidatedSetupColor, retiredFade)
+            cisdDraw := color.new(cisdBase, math.min(90, retiredFade))
+            zoneDraw := color.new(retiredObjectiveColor, effectiveZoneTransparency)
+            objectiveDraw := color.new(retiredObjectiveColor, math.min(82, retiredFade))
         int nativeMs = safeTfSeconds(result.confirmationTf) * 1000
         // Align the STDV markers with the manipulation anchor candle instead of
         // shifting them right of the completed CISD/structure confirmation.
@@ -1697,7 +1714,7 @@ renderProjection(Projection projection, bool visible, int transparency, int prim
                 int x2 = anchorRatio ? result.confirmationTime + nativeMs : markerEnd
                 lineStyle = anchorRatio ? lineStyleFromString(anchorLineStyleInput) : lineStyleFromString(stdvLineStyleInput)
                 int width = anchorRatio ? anchorLineWidth : stdvLineWidth
-                color ratioDraw = anchorRatio ? anchorDraw : baseStructure
+                color ratioDraw = anchorRatio ? anchorDraw : objectiveDraw
                 line ratioLine = line.new(x1=x1, y1=price, x2=x2, y2=price, xloc=xloc.bar_time,
                      extend=extend.none, color=ratioDraw, style=lineStyle, width=width)
                 // The manipulation and swing anchors remain visible as lines,
@@ -1732,7 +1749,7 @@ renderProjection(Projection projection, bool visible, int transparency, int prim
             for i = 0 to result.ratioLines.size() - 1
                 float ratio = result.ratios.get(i)
                 bool anchorRatio = ratio == 0.0 or ratio == 1.0
-                color ratioDraw = anchorRatio ? anchorDraw : baseStructure
+                color ratioDraw = anchorRatio ? anchorDraw : objectiveDraw
                 line.set_color(result.ratioLines.get(i), ratioDraw)
                 label ratioLabel = result.ratioLabels.get(i)
                 if not na(ratioLabel)
@@ -2086,15 +2103,13 @@ if projections.size() > 0
                     projection.endTime := time
             projections.set(lifecycleIndex, projection)
 
-        // Retire, never delete. A dead setup keeps its record and leaves one
-        // dotted ghost marker at the level where it died, so the chart cannot
-        // silently show only the winners.
+        // Retire, never delete. A dead setup keeps its record AND its complete
+        // drawing: the render loop below repaints every level it owns in the
+        // retired palette, so a failure can never be filtered away. Only setups
+        // outside the full-drawing window degrade to a ghost stub there.
         Projection checkedProjection = projections.get(lifecycleIndex)
         if checkedProjection.status != 0 and na(checkedProjection.deadTime)
-            checkedProjection := deleteProjectionDrawings(checkedProjection)
             checkedProjection.deadTime := nz(checkedProjection.endTime, time)
-            if showInvalidatedSetups
-                pushGhost(checkedProjection)
             projections.set(lifecycleIndex, checkedProjection)
         lifecycleIndex -= 1
 
@@ -2360,10 +2375,22 @@ if projections.size() > 0
                     livePrimaryBearIndex := i
                     livePrimaryBearTime := liveCandidate.confirmationTime
 
+    // v4 — retired sets keep their full drawing while they are among the
+    // newest `deadDrawLimit` of them. Anything older drops back to a single
+    // ghost mark, which is what keeps max_lines_count / max_labels_count safe.
+    float deadFullCutoff = na
+    if showInvalidatedSetups and deadDrawLimit > 0 and projections.size() > 0
+        array<int> retiredTimes = array.new_int()
+        for k = 0 to projections.size() - 1
+            Projection retiredCandidate = projections.get(k)
+            if retiredCandidate.status != 0 and not na(retiredCandidate.deadTime)
+                retiredTimes.push(retiredCandidate.deadTime)
+        if retiredTimes.size() > deadDrawLimit
+            array.sort(retiredTimes, order.descending)
+            deadFullCutoff := retiredTimes.get(deadDrawLimit - 1)
+
     for i = 0 to projections.size() - 1
         Projection projection = projections.get(i)
-        // Retired setups already had their drawings removed when they died and
-        // are represented by a ghost. Nothing left to render here.
         if projection.status == 0
             bool visible = selectedProjection.get(i)
             int newerSelected = 0
@@ -2390,6 +2417,28 @@ if projections.size() > 0
             projection := renderProjection(projection, visible, transparency, primaryWindowZoneRole,
                  liveExtensionOwner, drawSignal)
             projections.set(i, projection)
+        else
+            // Retired set. It is drawn exactly like a live one — same anchors,
+            // same levels, same zones, same CISD span — but with the retired
+            // palette, and it never raises a BUY/SELL signal.
+            Projection retired = projection
+            if not na(retired.signalLabel) or not na(retired.slLine) or
+                 not na(retired.tpLine) or not na(retired.tpLine2)
+                retired := deleteSignalDrawings(retired)
+            bool retiredVisible = showInvalidatedSetups and deadDrawLimit > 0 and
+                 layerPrimaryVisible(retired.layer) and layerConfigurationValid(retired.layer) and
+                 not na(retired.deadTime) and (na(deadFullCutoff) or retired.deadTime >= deadFullCutoff)
+            if retiredVisible
+                retired := renderProjection(retired, true, layerHistoricalOpacity(retired.layer), 0, false, false)
+            else
+                if retired.ratioLines.size() > 0 or retired.ratioLabels.size() > 0 or
+                     retired.ratioBoxes.size() > 0 or not na(retired.cisdLine) or
+                     not na(retired.liveMinusTwoBox) or not na(retired.liveMinusFourBox)
+                    retired := deleteProjectionDrawings(retired)
+                if showInvalidatedSetups and not retired.ghosted
+                    pushGhost(retired)
+                    retired.ghosted := true
+            projections.set(i, retired)
 
 // =============================================================================
 // OPTIONAL COMPACT STATUS TABLE
