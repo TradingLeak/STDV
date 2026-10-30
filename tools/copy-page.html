@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bandz STDV &amp; CISD — copy mã</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: #12151a; color: #e6e9ef;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: #8b95a5; font-size: 13px; margin-bottom: 20px; }
+  .sub b { color: #c8d0dc; font-weight: 600; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+  button, .dl {
+    font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid transparent;
+    padding: 11px 18px; cursor: pointer; text-decoration: none; display: inline-block;
+    transition: transform .06s ease, background .15s ease, border-color .15s ease;
+  }
+  button:active, .dl:active { transform: translateY(1px); }
+  #copy { background: #0f9d8a; color: #04120f; border-color: #0f9d8a; min-width: 230px; }
+  #copy:hover { background: #14b8a2; }
+  #copy.ok { background: #2ecc71; border-color: #2ecc71; }
+  #copy.fail { background: #b4453c; border-color: #b4453c; color: #fff; }
+  .dl { background: transparent; color: #c8d0dc; border-color: #2b323d; font-weight: 500; }
+  .dl:hover { border-color: #45505f; }
+  #status { font-size: 13px; color: #8b95a5; min-height: 20px; flex: 1 1 240px; }
+  #status.good { color: #4ade9b; }
+  #status.bad { color: #ef8b82; }
+  textarea {
+    width: 100%; height: 58vh; min-height: 320px; resize: vertical;
+    background: #0b0e12; color: #b9c4d2; border: 1px solid #232a34; border-radius: 10px;
+    padding: 14px; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre; overflow: auto; tab-size: 4;
+  }
+  textarea:focus { outline: none; border-color: #0f9d8a; }
+  .hint { margin-top: 14px; font-size: 12.5px; color: #77808e; }
+  .hint code { background: #1a1f27; padding: 2px 6px; border-radius: 4px; color: #b9c4d2; }
+  .warn { margin-top: 14px; padding: 12px 14px; border-radius: 8px; font-size: 13px;
+          background: #1d1a12; border: 1px solid #3d3320; color: #d9c48a; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Bandz STDV &amp; CISD — v4</h1>
+  <div class="sub">
+    <b id="lines">…</b> dòng · Pine Script v6 · đọc trực tiếp từ <code style="color:#c8d0dc">src/bandz_stdv_cisd.pine</code>
+  </div>
+
+  <div class="bar">
+    <button id="copy" disabled>Đang tải…</button>
+    <a class="dl" id="download" href="code.pine" download="bandz_stdv_cisd.pine">Tải file .pine</a>
+    <span id="status"></span>
+  </div>
+
+  <textarea id="code" readonly spellcheck="false" placeholder="Đang tải mã…"></textarea>
+
+  <div class="hint">
+    Dán vào TradingView: Pine Editor → <code>Ctrl+A</code> → <code>Ctrl+V</code> → Save.
+    Dòng cuối cùng phải là <code>alert(alertText, alert.freq_once_per_bar_close)</code>.
+  </div>
+
+  <div class="warn" id="warn" style="display:none"></div>
+</div>
+
+<script>
+  const ta = document.getElementById('code');
+  const btn = document.getElementById('copy');
+  const st = document.getElementById('status');
+  const linesEl = document.getElementById('lines');
+  const warn = document.getElementById('warn');
+
+  function say(msg, cls) {
+    st.textContent = msg;
+    st.className = cls || '';
+  }
+
+  function markOk() {
+    btn.classList.remove('fail');
+    btn.classList.add('ok');
+    btn.textContent = '✓ Đã copy toàn bộ';
+    say('Dán trực tiếp vào Pine Editor là xong.', 'good');
+    setTimeout(() => {
+      btn.classList.remove('ok');
+      btn.textContent = 'Copy toàn bộ mã';
+    }, 2600);
+  }
+
+  function selectAll() {
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+  }
+
+  async function copyAll() {
+    const text = ta.value;
+    if (!text) return;
+    // 1) Async clipboard (cần HTTPS + quyền clipboard-write).
+    try {
+      await navigator.clipboard.writeText(text);
+      markOk();
+      return;
+    } catch (_) { /* rơi xuống fallback */ }
+    // 2) execCommand: hoạt động trong iframe, chỉ cần thao tác người dùng.
+    try {
+      selectAll();
+      if (document.execCommand('copy')) { markOk(); return; }
+    } catch (_) { /* rơi xuống fallback */ }
+    // 3) Không copy được tự động: bôi đen sẵn để người dùng bấm Ctrl+C.
+    selectAll();
+    btn.classList.add('fail');
+    btn.textContent = 'Bấm Ctrl+C';
+    say('Trình duyệt chặn clipboard — mã đã được bôi đen, bấm Ctrl+C (Mac: ⌘C).', 'bad');
+  }
+
+  btn.addEventListener('click', copyAll);
+  ta.addEventListener('click', () => { if (ta.value) say('Đã chọn toàn bộ — Ctrl+C để copy.', ''); });
+
+  (async function load() {
+    try {
+      const res = await fetch('code.pine', { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const text = await res.text();
+      ta.value = text;
+      const count = text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length;
+      linesEl.textContent = count.toLocaleString('vi-VN');
+      btn.disabled = false;
+      btn.textContent = 'Copy toàn bộ mã (' + count.toLocaleString('vi-VN') + ' dòng)';
+      const last = text.trimEnd().split('\n').pop().trim();
+      if (last !== 'alert(alertText, alert.freq_once_per_bar_close)') {
+        warn.style.display = 'block';
+        warn.textContent = 'Cảnh báo: dòng cuối không đúng như mong đợi (' + last + '). Kiểm tra lại file nguồn.';
+      }
+      say('');
+    } catch (err) {
+      btn.disabled = true;
+      btn.textContent = 'Không tải được mã';
+      say('Lỗi khi tải code.pine: ' + err.message, 'bad');
+    }
+  })();
+</script>
+</body>
+</html>
