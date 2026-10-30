@@ -121,6 +121,12 @@ type Projection
     line cisdLine
     label cisdLabel
     int deadTime                   // v2: when the setup was retired (-1 / -2 status). na while active.
+    float entry                    // v3: close of the confirming candle = signal entry price
+    label signalLabel              // v3: BUY / SELL tag with SL and TP
+    line slLine                    // v3
+    line tpLine                    // v3
+    line tpLine2                   // v3
+    bool tpMarked                  // v3: first objective already tagged
 
 // =============================================================================
 // INPUTS
@@ -380,6 +386,18 @@ bool showPendingCisd = input.bool(false, "Show forming CISD", group=GROUP_VISUAL
 // v2: retired setups stay on the chart instead of silently disappearing.
 bool showInvalidatedSetups = input.bool(true, "Show invalidated / completed sets", group=GROUP_VISUAL,
      tooltip="A setup that is invalidated or runs to -4 keeps a dotted marker at the level where it died. Turn this off to hide the failures, but the statistics are still recorded.")
+color invalidatedSetupColor = input.color(color.rgb(120, 130, 145), "Invalidated / completed sets", inline="ghost", group=GROUP_VISUAL)
+
+string GROUP_SIGNALS = "Buy / Sell signals"
+bool showSignals = input.bool(true, "BUY / SELL confirmation", group=GROUP_SIGNALS,
+     tooltip="Draws one entry tag with entry, SL and TP for the newest active bullish and bearish set of the chart's primary group. Slower timeframes are excluded so the chart keeps a single long and a single short idea.")
+bool showSignalLevels = input.bool(true, "Draw SL / TP lines", group=GROUP_SIGNALS)
+bool showSecondTarget = input.bool(false, "Show second target (-4)", group=GROUP_SIGNALS)
+bool showSignalHits = input.bool(true, "Mark TP hits", group=GROUP_SIGNALS)
+color buySignalColor = input.color(color.rgb(0, 137, 123), "BUY", inline="sig1", group=GROUP_SIGNALS)
+color sellSignalColor = input.color(color.rgb(211, 47, 47), "SELL", inline="sig1", group=GROUP_SIGNALS)
+color slSignalColor = input.color(color.rgb(211, 47, 47), "SL", inline="sig2", group=GROUP_SIGNALS)
+color tpSignalColor = input.color(color.rgb(0, 137, 123), "TP", inline="sig2", group=GROUP_SIGNALS)
 bool useChartForeground = false
 bool showStatusTable = false
 
@@ -1339,6 +1357,36 @@ buildRatios() =>
 structureColor(int layer) =>
     useChartForeground ? chart.fg_color : stdvColor
 
+// Signal drawings are kept bounded and reusable: the BUY/SELL tag and the SL/TP
+// rails belong to the newest setup of each direction, and a TP touch leaves one
+// tiny marker in a capped ring so the drawing budget can never leak.
+var array<label> tpHitLabels = array.new_label()
+const int TP_HIT_LIMIT = 60
+
+pushTpHit(int when, float price) =>
+    tpHitLabels.push(label.new(x=when, y=price, text="TP", xloc=xloc.bar_time, yloc=yloc.price,
+         style=label.style_none, color=color.new(color.white, 100), textcolor=tpSignalColor,
+         size=size.tiny, text_font_family=font.family_monospace))
+    if tpHitLabels.size() > TP_HIT_LIMIT
+        label.delete(tpHitLabels.shift())
+    0
+
+deleteSignalDrawings(Projection projection) =>
+    Projection result = projection
+    if not na(result.signalLabel)
+        label.delete(result.signalLabel)
+        result.signalLabel := na
+    if not na(result.slLine)
+        line.delete(result.slLine)
+        result.slLine := na
+    if not na(result.tpLine)
+        line.delete(result.tpLine)
+        result.tpLine := na
+    if not na(result.tpLine2)
+        line.delete(result.tpLine2)
+        result.tpLine2 := na
+    result
+
 deleteProjectionDrawings(Projection projection) =>
     Projection result = projection
     if result.ratioLines.size() > 0
@@ -1369,6 +1417,18 @@ deleteProjectionDrawings(Projection projection) =>
     if not na(result.cisdLabel)
         label.delete(result.cisdLabel)
         result.cisdLabel := na
+    if not na(result.signalLabel)
+        label.delete(result.signalLabel)
+        result.signalLabel := na
+    if not na(result.slLine)
+        line.delete(result.slLine)
+        result.slLine := na
+    if not na(result.tpLine)
+        line.delete(result.tpLine)
+        result.tpLine := na
+    if not na(result.tpLine2)
+        line.delete(result.tpLine2)
+        result.tpLine2 := na
     result
 
 // -----------------------------------------------------------------------------
@@ -1387,10 +1447,12 @@ pushGhost(Projection projection) =>
     if not na(projection.anchor1Time) and not na(projection.deadTime) and projection.deadTime > projection.anchor1Time
         float ghostPrice = projection.status == 2 ?
              projectionPrice(projection.anchor0, projection.anchor1, -4.0) : projection.anchor1
-        color ghostColor = projection.status == 2 ? color.new(color.gray, 40) : color.new(color.red, 40)
+        // Neutral on purpose: retired setups must be readable without competing
+        // with the live levels, so they are a pale grey-blue instead of red.
+        color ghostColor = color.new(invalidatedSetupColor, projection.status == 2 ? 55 : 68)
         ghostLines.push(line.new(x1=projection.anchor1Time, y1=ghostPrice, x2=projection.deadTime, y2=ghostPrice,
              xloc=xloc.bar_time, extend=extend.none, color=ghostColor, style=line.style_dotted, width=1))
-        ghostLabels.push(label.new(x=projection.deadTime, y=ghostPrice, text=projection.status == 2 ? "-4" : "x",
+        ghostLabels.push(label.new(x=projection.deadTime, y=ghostPrice, text=projection.status == 2 ? "-4" : "SL",
              xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none,
              color=color.new(color.white, 100), textcolor=ghostColor, size=size.tiny,
              text_font_family=font.family_monospace))
@@ -1408,7 +1470,7 @@ buildEventId(int layer, int direction, string liquidityTf, int referenceTime, fl
 newProjection(int layer, int direction, int competitionStart, int revision, int confirmationTime, int firstSweepTime,
               int anchor0Time, float anchor0, int anchor1Time, float anchor1,
               int cisdOriginTime, int cisdConfirmTime, float cisd,
-              int referenceTime, float referencePrice, float winnerScore) =>
+              int referenceTime, float referencePrice, float winnerScore, float entryPrice) =>
     Projection.new(layer, direction, layerConfirmationTf(layer), layerLiquidityTf(layer), layerCompetitionTf(layer),
          competitionStart, revision, confirmationTime, firstSweepTime, anchor0Time, anchor0, anchor1Time, anchor1,
          cisdOriginTime, cisdConfirmTime, cisd, referenceTime, referencePrice,
@@ -1416,7 +1478,7 @@ newProjection(int layer, int direction, int competitionStart, int revision, int 
          anchor1Time, anchor1, cisdConfirmTime, confirmationTime),
          math.abs(anchor0 - anchor1), winnerScore, 0, na, confirmationTime, na, na,
          buildRatios(), array.new_line(), array.new_label(), array.new<box>(), na, na, na, na,
-         na)
+         na, entryPrice, na, na, na, na, false)
 
 // Retired projections must never be treated as a slot for a new event, and must
 // never be replaced by one, so every finder below only looks at live status 0.
@@ -1457,7 +1519,7 @@ findNearDuplicate(int layer, int direction, int referenceTime, float referencePr
 upsertWinner(int layer, int direction, int revision, int competitionStart, int confirmationTime, int firstSweepTime,
              int anchor0Time, float anchor0, int anchor1Time, float anchor1,
              int cisdOriginTime, int cisdConfirmTime, float cisd,
-             int referenceTime, float referencePrice, float winnerScore) =>
+             int referenceTime, float referencePrice, float winnerScore, float entryPrice) =>
     bool valid = layerVisible(layer) and layerConfigurationValid(layer) and
          not na(revision) and revision > 0 and not na(competitionStart) and not na(confirmationTime) and not na(firstSweepTime) and
          not na(anchor0Time) and not na(anchor0) and not na(anchor1Time) and not na(anchor1) and
@@ -1484,7 +1546,7 @@ upsertWinner(int layer, int direction, int revision, int competitionStart, int c
         if shouldUse
             Projection fresh = newProjection(layer, direction, competitionStart, revision, confirmationTime, firstSweepTime,
                  anchor0Time, anchor0, anchor1Time, anchor1, cisdOriginTime, cisdConfirmTime, cisd,
-                 referenceTime, referencePrice, winnerScore)
+                 referenceTime, referencePrice, winnerScore, entryPrice)
             if not na(target)
                 Projection old = projections.get(target)
                 old := deleteProjectionDrawings(old)
@@ -1601,7 +1663,8 @@ projectionTargetTouched(Projection projection, float ratio, float barHigh, float
     float target = projectionPrice(projection.anchor0, projection.anchor1, ratio)
     projection.direction == 1 ? barHigh >= target : barLow <= target
 
-renderProjection(Projection projection, bool visible, int transparency, int primaryWindowZoneRole, bool liveExtensionOwner) =>
+renderProjection(Projection projection, bool visible, int transparency, int primaryWindowZoneRole,
+                 bool liveExtensionOwner, bool drawSignal) =>
     Projection result = projection
     if not visible
         result := deleteProjectionDrawings(result)
@@ -1742,6 +1805,52 @@ renderProjection(Projection projection, bool visible, int transparency, int prim
         else if not na(result.liveMinusFourBox)
             box.delete(result.liveMinusFourBox)
             result.liveMinusFourBox := na
+
+        // ---------------------------------------------------------------------
+        // v3 — BUY / SELL confirmation with SL and TP
+        // Only the newest active bullish and bearish set of the chart's primary
+        // group raises a signal, so the chart keeps at most one long and one
+        // short entry instead of a wall of tags.
+        // ---------------------------------------------------------------------
+        if drawSignal and result.status == 0
+            float signalEntry = na(result.entry) ? result.cisd : result.entry
+            float firstTarget = projectionPrice(result.anchor0, result.anchor1, -2.0)
+            float secondTarget = projectionPrice(result.anchor0, result.anchor1, -4.0)
+            color signalDraw = result.direction == 1 ? buySignalColor : sellSignalColor
+            if na(result.signalLabel)
+                string signalText = (result.direction == 1 ? "BUY " : "SELL ") + timeframeText(result.confirmationTf) +
+                     "\nE " + str.tostring(signalEntry, format.mintick) +
+                     "\nSL " + str.tostring(result.anchor1, format.mintick) +
+                     "\nTP " + str.tostring(firstTarget, format.mintick)
+                if showSecondTarget
+                    signalText := signalText + "\nTP2 " + str.tostring(secondTarget, format.mintick)
+                result.signalLabel := label.new(x=result.confirmationTime, y=signalEntry, text=signalText,
+                     xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left,
+                     color=color.new(signalDraw, 10), textcolor=color.white, size=size.small,
+                     text_font_family=font.family_monospace)
+
+            if showSignalLevels
+                if na(result.slLine)
+                    result.slLine := line.new(x1=result.confirmationTime, y1=result.anchor1,
+                         x2=time_close, y2=result.anchor1, xloc=xloc.bar_time, extend=extend.right,
+                         color=color.new(slSignalColor, 25), style=line.style_dashed, width=2)
+                if na(result.tpLine)
+                    result.tpLine := line.new(x1=result.confirmationTime, y1=firstTarget,
+                         x2=time_close, y2=firstTarget, xloc=xloc.bar_time, extend=extend.right,
+                         color=color.new(tpSignalColor, 25), style=line.style_dashed, width=2)
+                if showSecondTarget and na(result.tpLine2)
+                    result.tpLine2 := line.new(x1=result.confirmationTime, y1=secondTarget,
+                         x2=time_close, y2=secondTarget, xloc=xloc.bar_time, extend=extend.right,
+                         color=color.new(tpSignalColor, 50), style=line.style_dotted, width=1)
+
+            if showSignalHits and not result.tpMarked and not na(result.firstObjectiveHitTime)
+                result.tpMarked := true
+                pushTpHit(result.firstObjectiveHitTime, firstTarget)
+        else
+            // A setup that is no longer the newest of its direction drops its
+            // entry tag and rails, so only one long and one short signal stay
+            // on screen at any time.
+            result := deleteSignalDrawings(result)
     result
 
 // =============================================================================
@@ -1761,7 +1870,8 @@ ingestSnapshot(int layer, LayerSnapshot snapshot) =>
                      snapshot.bullFirstSweepTime,
                      snapshot.bullA0Time, snapshot.bullA0, snapshot.bullA1Time, snapshot.bullA1,
                      snapshot.bullCisdOriginTime, snapshot.bullCisdConfirmTime, snapshot.bullCisd,
-                     snapshot.bullReferenceTime, snapshot.bullReferencePrice, snapshot.bullScore)
+                     snapshot.bullReferenceTime, snapshot.bullReferencePrice, snapshot.bullScore,
+                     snapshot.nativeClose)
                 lastBullRevision.set(layer, snapshot.bullRevision)
 
             if snapshot.bearRevision > seenBear
@@ -1769,7 +1879,8 @@ ingestSnapshot(int layer, LayerSnapshot snapshot) =>
                      snapshot.bearFirstSweepTime,
                      snapshot.bearA0Time, snapshot.bearA0, snapshot.bearA1Time, snapshot.bearA1,
                      snapshot.bearCisdOriginTime, snapshot.bearCisdConfirmTime, snapshot.bearCisd,
-                     snapshot.bearReferenceTime, snapshot.bearReferencePrice, snapshot.bearScore)
+                     snapshot.bearReferenceTime, snapshot.bearReferencePrice, snapshot.bearScore,
+                     snapshot.nativeClose)
                 lastBearRevision.set(layer, snapshot.bearRevision)
 
             pendingBullId.set(layer, snapshot.bullPendingId)
@@ -2275,7 +2386,9 @@ if projections.size() > 0
                 primaryWindowZoneRole := isPrimaryExtreme ? 1 : -1
 
             bool liveExtensionOwner = i == livePrimaryBullIndex or i == livePrimaryBearIndex
-            projection := renderProjection(projection, visible, transparency, primaryWindowZoneRole, liveExtensionOwner)
+            bool drawSignal = showSignals and liveExtensionOwner and not selectedMtfProjection.get(i)
+            projection := renderProjection(projection, visible, transparency, primaryWindowZoneRole,
+                 liveExtensionOwner, drawSignal)
             projections.set(i, projection)
 
 // =============================================================================
@@ -2303,3 +2416,49 @@ if barstate.islast
             table.cell(statusTable, 6, layer + 1, str.tostring(lastBearRevision.get(layer)))
     else
         table.clear(statusTable, 0, 0, 6, 7)
+
+// =============================================================================
+// CONFIRMATION ALERTS
+// Create the alert with "Any alert() function call" so the message can carry
+// the entry, SL, TP and R:R of the setup that just confirmed.
+// =============================================================================
+
+var array<int> alertSeenBull = array.new_int(7, 0)
+var array<int> alertSeenBear = array.new_int(7, 0)
+bool newBuySignal = false
+bool newSellSignal = false
+
+for layer = 0 to 6
+    if layerPrimaryVisible(layer) and layerConfigurationValid(layer)
+        if lastBullRevision.get(layer) > alertSeenBull.get(layer)
+            alertSeenBull.set(layer, lastBullRevision.get(layer))
+            newBuySignal := true
+        if lastBearRevision.get(layer) > alertSeenBear.get(layer)
+            alertSeenBear.set(layer, lastBearRevision.get(layer))
+            newSellSignal := true
+
+if newBuySignal or newSellSignal
+    int alertDirection = newBuySignal ? 1 : -1
+    int alertIndex = na
+    int alertTime = na
+    if projections.size() > 0
+        for i = 0 to projections.size() - 1
+            Projection candidate = projections.get(i)
+            if candidate.status == 0 and candidate.direction == alertDirection and
+                 layerPrimaryVisible(candidate.layer) and
+                 (na(alertTime) or candidate.confirmationTime > alertTime)
+                alertIndex := i
+                alertTime := candidate.confirmationTime
+    if not na(alertIndex)
+        Projection alertSetup = projections.get(alertIndex)
+        float alertEntry = na(alertSetup.entry) ? alertSetup.cisd : alertSetup.entry
+        float alertTarget = projectionPrice(alertSetup.anchor0, alertSetup.anchor1, -2.0)
+        float alertRisk = math.abs(alertEntry - alertSetup.anchor1)
+        float alertReward = math.abs(alertTarget - alertEntry)
+        float alertRr = alertRisk > 0 ? alertReward / alertRisk : 0.0
+        string alertText = (alertSetup.direction == 1 ? "BUY " : "SELL ") + timeframeText(alertSetup.confirmationTf) +
+             " | Entry " + str.tostring(alertEntry, format.mintick) +
+             " | SL " + str.tostring(alertSetup.anchor1, format.mintick) +
+             " | TP " + str.tostring(alertTarget, format.mintick) +
+             " | RR " + str.tostring(alertRr, "#.##")
+        alert(alertText, alert.freq_once_per_bar_close)
