@@ -128,6 +128,7 @@ type Projection
     line tpLine2                   // v3
     bool tpMarked                  // v3: first objective already tagged
     bool ghosted                   // v4: retired set already reduced to a ghost stub
+    bool retiredPainted            // v5: retired palette already applied once
 
 // =============================================================================
 // INPUTS
@@ -391,6 +392,10 @@ color invalidatedSetupColor = input.color(color.rgb(120, 130, 145), "Retired str
 color retiredObjectiveColor = input.color(color.rgb(214, 158, 46), "Retired objectives", inline="ghost", group=GROUP_VISUAL)
 int deadDrawLimit = input.int(12, "Retired sets drawn in full", minval=0, maxval=40, group=GROUP_VISUAL,
      tooltip="How many of the newest retired setups keep their complete drawing. Each full set costs roughly 17 drawings (lines, labels, zones), so raise this slowly to stay inside the 500-drawing limit. Older retired setups fall back to one ghost mark. 0 = ghost marks only.")
+
+string GROUP_PERF = "Performance"
+int maxStoredRecords = input.int(120, "Max stored sets", minval=30, maxval=300, step=10, group=GROUP_PERF,
+     tooltip="How many setups the script keeps in memory. Every bar loops over this list, so a large number costs calculation time on every candle. Retired setups that fall out of the list lose their record (their ghost mark stays). Lower this first if TradingView reports that the script is too slow to run on the chart.")
 
 string GROUP_SIGNALS = "Buy / Sell signals"
 bool showSignals = input.bool(true, "BUY / SELL confirmation", group=GROUP_SIGNALS,
@@ -1346,8 +1351,10 @@ var array<int> debugBullCandidateCount = array.new_int(7, 0)
 var array<int> debugBearCandidateCount = array.new_int(7, 0)
 var array<int> debugReferenceHighTime = array.new_int(7)
 var array<int> debugReferenceLowTime = array.new_int(7)
-// Raised from 140 because retired projections now stay in memory as records.
-int GLOBAL_PROJECTION_LIMIT = 300
+// Retired projections stay in memory as records, but the list is walked on
+// every bar, so its size is a direct per-bar cost. The cap is an input now
+// instead of a constant so a slow chart can be traded for shorter history.
+int GLOBAL_PROJECTION_LIMIT = maxStoredRecords
 
 buildRatios() =>
     array<float> ratios = array.new<float>()
@@ -1482,7 +1489,7 @@ newProjection(int layer, int direction, int competitionStart, int revision, int 
          anchor1Time, anchor1, cisdConfirmTime, confirmationTime),
          math.abs(anchor0 - anchor1), winnerScore, 0, na, confirmationTime, na, na,
          buildRatios(), array.new_line(), array.new_label(), array.new<box>(), na, na, na, na,
-         na, entryPrice, na, na, na, na, false, false)
+         na, entryPrice, na, na, na, na, false, false, false)
 
 // Retired projections must never be treated as a slot for a new event, and must
 // never be replaced by one, so every finder below only looks at live status 0.
@@ -2210,16 +2217,27 @@ if projections.size() > 0
     // MTF groups are selected separately below and keep their existing behavior.
     array<int> primaryLowestExtremeIndex = array.new_int(7)
     array<int> primaryHighestExtremeIndex = array.new_int(7)
+    // v5 performance: retention and near-price are properties of a set, not of
+    // a layer, so they are evaluated once per bar instead of once per layer.
+    // The per-layer loop then only reads two flags.
+    array<bool> setLive = array.new_bool()
+    array<bool> setRelevant = array.new_bool()
+    if projections.size() > 0
+        for i = 0 to projections.size() - 1
+            Projection storedSet = projections.get(i)
+            bool storedLive = storedSet.status == 0
+            bool storedWithinRetention = time <= storedSet.confirmationTime + projectionRetentionMs(storedSet)
+            setLive.push(storedLive)
+            setRelevant.push(storedLive and (storedWithinRetention or projectionNearPrice(storedSet)))
+
     for layer = 0 to 6
         if layerPrimaryVisible(layer)
             int activeCompetitionStart = layerCompetitionStart(layer)
             array<int> candidates = array.new_int()
             for i = 0 to projections.size() - 1
                 Projection projection = projections.get(i)
-                bool withinRetention = time <= projection.confirmationTime + projectionRetentionMs(projection)
-                bool unresolvedAndRelevant = projection.status == 0 and
-                     (withinRetention or projectionNearPrice(projection))
-                bool protectedWindowSet = protectCompetitionExtremes and projection.status == 0 and
+                bool unresolvedAndRelevant = setRelevant.get(i)
+                bool protectedWindowSet = protectCompetitionExtremes and setLive.get(i) and
                      projection.competitionStart == activeCompetitionStart
                 if projection.layer == layer and (unresolvedAndRelevant or protectedWindowSet)
                     candidates.push(i)
@@ -2375,6 +2393,14 @@ if projections.size() > 0
                     livePrimaryBearIndex := i
                     livePrimaryBearTime := liveCandidate.confirmationTime
 
+    // v5 performance: the fade of a live set only depends on the other sets that
+    // are actually drawn, so the render loop walks a short index list instead of
+    // the whole store (that used to be a full scan of the array per projection).
+    array<int> selectedIndices = array.new_int()
+    for i = 0 to projections.size() - 1
+        if selectedProjection.get(i)
+            selectedIndices.push(i)
+
     // v4 — retired sets keep their full drawing while they are among the
     // newest `deadDrawLimit` of them. Anything older drops back to a single
     // ghost mark, which is what keeps max_lines_count / max_labels_count safe.
@@ -2395,9 +2421,10 @@ if projections.size() > 0
             bool visible = selectedProjection.get(i)
             int newerSelected = 0
             if visible
-                for j = 0 to projections.size() - 1
-                    if i != j and selectedProjection.get(j)
-                        Projection other = projections.get(j)
+                for j = 0 to selectedIndices.size() - 1
+                    int otherIndex = selectedIndices.get(j)
+                    if otherIndex != i
+                        Projection other = projections.get(otherIndex)
                         if other.layer == projection.layer and other.confirmationTime > projection.confirmationTime
                             newerSelected += 1
             int transparency = newerSelected == 0 ? 0 :
@@ -2429,7 +2456,12 @@ if projections.size() > 0
                  layerPrimaryVisible(retired.layer) and layerConfigurationValid(retired.layer) and
                  not na(retired.deadTime) and (na(deadFullCutoff) or retired.deadTime >= deadFullCutoff)
             if retiredVisible
-                retired := renderProjection(retired, true, layerHistoricalOpacity(retired.layer), 0, false, false)
+                // A retired set never moves again: its anchors, its end time and
+                // its fade are all frozen, so the palette is applied once instead
+                // of touching ~30 drawings on every single bar.
+                if not retired.retiredPainted
+                    retired := renderProjection(retired, true, layerHistoricalOpacity(retired.layer), 0, false, false)
+                    retired.retiredPainted := true
             else
                 if retired.ratioLines.size() > 0 or retired.ratioLabels.size() > 0 or
                      retired.ratioBoxes.size() > 0 or not na(retired.cisdLine) or
